@@ -9,8 +9,10 @@ import InterpolatedTranslation from "./InterpolatedTranslation.svelte";
 import { t } from "@transifex/native";
 import type { SupportedTypeMapped, SupportedTypesWithMapped } from "./types";
 import throttle from "lodash/throttle";
+import ComparisonPage from "./ComparisonPage.svelte";
 
 let item: { type: string; id: string } | null = null;
+let search: string = ""; // MOVED and initialized
 
 let builds:
   | {
@@ -106,13 +108,19 @@ function decodeQueryParam(p: string) {
 function load() {
   const path = location.pathname.slice(import.meta.env.BASE_URL.length - 1);
   let m: RegExpExecArray | null;
-  if ((m = /^\/([^\/]+)(?:\/(.+))?$/.exec(path))) {
+
+  if (path === "/compare" || path.startsWith("/compare/")) {
+    // ADDED
+    item = { type: "compare", id: "" }; // ADDED
+    search = ""; // ADDED
+  } else if ((m = /^\/([^\/]+)(?:\/(.+))?$/.exec(path))) {
     const [, type, id] = m;
     if (type === "search") {
       item = null;
       search = decodeQueryParam(id ?? "");
     } else {
       item = { type, id: id ? decodeURIComponent(id) : "" };
+      search = ""; // ADDED to clear search when viewing item/catalog
     }
 
     window.scrollTo(0, 0);
@@ -120,20 +128,35 @@ function load() {
     item = null;
     search = "";
   }
+  if (item?.type !== "compare") {
+    // ADDED condition to only scroll if not compare page
+    window.scrollTo(0, 0);
+  }
 }
 
-$: if (item && item.id && $data && $data.byIdMaybe(item.type as any, item.id)) {
+$: if (
+  item &&
+  item.id &&
+  $data &&
+  $data.byIdMaybe(item.type as any, item.id) &&
+  item.type !== "compare"
+) {
+  // ADDED item.type !== "compare"
   const it = $data.byId(item.type as any, item.id);
   document.title = `${singularName(
     it
   )} - The Hitchhiker's Guide to the Cataclysm`;
-} else if (item && !item.id && item.type) {
+} else if (item && !item.id && item.type && item.type !== "compare") {
+  // ADDED item.type !== "compare"
   document.title = `${item.type} - The Hitchhiker's Guide to the Cataclysm`;
+} else if (item && item.type === "compare") {
+  // ADDED
+  document.title = "Compare - The Hitchhiker's Guide to the Cataclysm";
 } else {
   document.title = "The Hitchhiker's Guide to the Cataclysm";
 }
 
-let search: string = "";
+// let search: string = ""; // MOVED to top of script block
 
 load();
 
@@ -146,36 +169,39 @@ const replaceState = throttle
   : history.replaceState.bind(history);
 
 const clearItem = () => {
-  if (item)
+  const newPath = search ? `search/${encodeURIComponent(search)}` : "";
+  // Only push/replace state if the intended path is different from current or if an item is active
+  if (
+    item ||
+    location.pathname.slice(import.meta.env.BASE_URL.length - 1) !==
+      (import.meta.env.BASE_URL + newPath).replace(/\/$/, "")
+  ) {
     history.pushState(
       null,
       "",
-      import.meta.env.BASE_URL +
-        (search ? "search/" + encodeURIComponent(search) : "") +
-        location.search
+      import.meta.env.BASE_URL + newPath + location.search
     );
-  else
-    replaceState(
-      null,
-      "",
-      import.meta.env.BASE_URL +
-        (search ? "search/" + encodeURIComponent(search) : "") +
-        location.search
-    );
-  item = null;
+    load(); // This will set item to null if newPath is search, or update item/search
+  } else if (!search && !item) {
+    // Already at home, search cleared
+    // Potentially do nothing or ensure state is clean if it was 'compare'
+    // load() would correctly set item to null and search to "" if path is "/"
+  }
+  // If search becomes empty and we were on /search/something, load() handles resetting item
+  // If search becomes empty and we were on /item/something, load() handles resetting item
 };
 
 function maybeNavigate(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
   const anchor = target?.closest("a") as HTMLAnchorElement | null;
   if (anchor && anchor.href) {
-    const { origin, pathname } = new URL(anchor.href);
+    const { origin, pathname, search: querySearch } = new URL(anchor.href); // Keep query params
     if (
       origin === location.origin &&
       pathname.startsWith(import.meta.env.BASE_URL)
     ) {
       event.preventDefault();
-      history.pushState(null, "", pathname + location.search);
+      history.pushState(null, "", pathname + querySearch); // Keep query params
       load();
     }
   }
@@ -286,15 +312,44 @@ function langHref(lang: string, href: string) {
   u.searchParams.set("lang", lang);
   return u.toString();
 }
+
+function handleVersionChange(event: Event) {
+  const target = event.currentTarget as HTMLSelectElement;
+  const buildNumberValue = target.value;
+  const currentUrl = new URL(location.href);
+  if (builds && buildNumberValue === builds[0].build_number) {
+    currentUrl.searchParams.delete("v");
+  } else {
+    currentUrl.searchParams.set("v", buildNumberValue);
+  }
+  location.href = currentUrl.toString();
+}
+
+function handleTilesetChange(event: Event) {
+  const target = event.currentTarget as HTMLSelectElement;
+  tilesetUrlTemplate = target.value;
+}
+
+function handleLanguageChange(event: Event) {
+  const target = event.currentTarget as HTMLSelectElement;
+  const lang = target.value;
+  const currentUrl = new URL(location.href);
+  if (lang === "en") {
+    currentUrl.searchParams.delete("lang");
+  } else {
+    currentUrl.searchParams.set("lang", lang);
+  }
+  location.href = currentUrl.toString();
+}
 </script>
 
 <svelte:window on:click={maybeNavigate} on:keydown={maybeFocusSearch} />
 
 <svelte:head>
   {#if builds}
-    {@const build_number =
-      version === "latest" ? builds[0].build_number : version}
-    {#each [...(builds.find((b) => b.build_number === build_number)?.langs ?? [])].sort( (a, b) => a.localeCompare(b) ) as lang}
+    {@const build_number_const =
+      version === "latest" && builds ? builds[0].build_number : version}
+    {#each [...(builds.find((b) => b.build_number === build_number_const)?.langs ?? [])].sort( (a, b) => a.localeCompare(b) ) as lang}
       <link
         rel="alternate"
         hreflang={lang}
@@ -310,7 +365,10 @@ function langHref(lang: string, href: string) {
       <strong>
         <a
           href={import.meta.env.BASE_URL + location.search}
-          on:click={() => (search = "")}
+          on:click={() => {
+            search = "";
+            load();
+          }}
           ><span class="wide">Hitchhiker's Guide to the Cataclysm</span><span
             class="narrow">HHG</span
           ></a>
@@ -330,7 +388,14 @@ function langHref(lang: string, href: string) {
   </nav>
 </header>
 <main>
-  {#if item}
+  {#if item && item.type === "compare"}
+    {#if $data}
+      <ComparisonPage data={$data} />
+    {:else}
+      <p>Loading comparison data...</p>
+      <!-- Or some other loading indicator -->
+    {/if}
+  {:else if item}
     {#if $data}
       {#key item}
         {#if item.id}
@@ -455,20 +520,24 @@ Anyway?`,
     <p>
       <InterpolatedTranslation
         str={t(
-          `The Guide is developed on {link_github} by {link_nornagon}. If you notice any problems, please {link_file_an_issue}!`,
+          `The Guide is developed on {link_github} by {link_nornagon}. If you notice any problems, please {link_file_an_issue}! You can also try the new {link_compare_page}.`,
           {
             link_github: "{link_github}",
             link_nornagon: "{link_nornagon}",
             link_file_an_issue: "{link_file_an_issue}",
+            link_compare_page: "{link_compare_page}",
           }
         )}
         slot0="link_github"
         slot1="link_nornagon"
-        slot2="link_file_an_issue">
+        slot2="link_file_an_issue"
+        slot3="link_compare_page">
         <a slot="0" href="https://github.com/nornagon/cdda-guide">GitHub</a>
         <a slot="1" href="https://www.nornagon.net">nornagon</a>
         <a slot="2" href="https://github.com/nornagon/cdda-guide/issues"
           >{t("file an issue")}</a>
+        <a slot="3" href="{import.meta.env.BASE_URL}compare{location.search}"
+          >comparison tool</a>
       </InterpolatedTranslation>
     </p>
 
@@ -523,15 +592,8 @@ Anyway?`,
         <!-- svelte-ignore a11y-no-onchange -->
         <select
           value={$data?.build_number ??
-            (version === "latest" ? builds[0].build_number : version)}
-          on:change={(e) => {
-            const url = new URL(location.href);
-            const buildNumber = e.currentTarget.value;
-            if (buildNumber === builds?.[0].build_number)
-              url.searchParams.delete("v");
-            else url.searchParams.set("v", buildNumber);
-            location.href = url.toString();
-          }}>
+            (version === "latest" && builds ? builds[0].build_number : version)}
+          on:change={handleVersionChange}>
           <optgroup label="Stable">
             {#each builds.filter((b) => !b.prerelease) as build}
               <option value={build.build_number}>{build.build_number}</option>
@@ -540,7 +602,7 @@ Anyway?`,
           <optgroup label="Experimental">
             {#each builds.filter((b) => b.prerelease) as build, i}
               <option value={build.build_number}
-                >{build.build_number}{#if i === 0}&nbsp;(latest){/if}</option>
+                >{build.build_number}{#if i === 0} (latest){/if}</option>
             {/each}
           </optgroup>
         </select>
@@ -555,11 +617,7 @@ Anyway?`,
     <span style="white-space: nowrap">
       {t("Tileset:")}
       <!-- svelte-ignore a11y-no-onchange -->
-      <select
-        value={tilesetUrlTemplate}
-        on:change={(e) => {
-          tilesetUrlTemplate = e.currentTarget.value;
-        }}>
+      <select value={tilesetUrlTemplate} on:change={handleTilesetChange}>
         <option value="">None (ASCII)</option>
         {#each tilesets as { name, url }}
           <option value={url}>{name}</option>
@@ -569,19 +627,11 @@ Anyway?`,
     <span style="white-space: nowrap">
       {t("Language:")}
       {#if builds}
-        {@const build_number =
-          version === "latest" ? builds[0].build_number : version}
-        <select
-          value={locale || "en"}
-          on:change={(e) => {
-            const url = new URL(location.href);
-            const lang = e.currentTarget.value;
-            if (lang === "en") url.searchParams.delete("lang");
-            else url.searchParams.set("lang", lang);
-            location.href = url.toString();
-          }}>
+        {@const build_number_lang_const =
+          version === "latest" && builds ? builds[0].build_number : version}
+        <select value={locale || "en"} on:change={handleLanguageChange}>
           <option value="en">English</option>
-          {#each [...(builds.find((b) => b.build_number === build_number)?.langs ?? [])].sort( (a, b) => a.localeCompare(b) ) as lang}
+          {#each [...(builds.find((b) => b.build_number === build_number_lang_const)?.langs ?? [])].sort( (a, b) => a.localeCompare(b) ) as lang}
             <option value={lang}>{getLanguageName(lang)}</option>
           {/each}
         </select>
