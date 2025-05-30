@@ -134,7 +134,7 @@ function getGunColumns(): ColumnDefinition[] {
       formatter: (val) => formatRangedDamage(val as GunSlot["ranged_damage"]),
     },
     {
-      key: "ranged_damage",
+      key: "ranged_damage_ap",
       label: "AP",
       sortable: true,
       formatter: (val) =>
