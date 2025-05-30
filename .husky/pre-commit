@@ -1,4 +1,48 @@
 #!/bin/sh
-. "$(dirname "$0")/_/husky.sh"
 
-npm run precommit
+# Get the directory of the node executable itself
+NODE_EXEC_PATH=$(dirname -- "$(command -v node)") 
+
+# Path to the npm CLI script
+# This is typically where it resides relative to node.exe
+NPM_CLI_JS="$NODE_EXEC_PATH/node_modules/npm/bin/npm-cli.js"
+
+# Path to the yarn CLI script (if installed globally via npm)
+# This path needs to be verified for your system.
+# It's often in AppData/Roaming/npm for global npm packages.
+# A more robust way to find yarn's actual script might be needed if this isn't standard.
+# For now, let's assume it's similar to npm if installed globally.
+# If yarn was installed by other means (e.g. corepack, or its own installer), this path will be different.
+# Since HHG uses yarn 1.x specified in packageManager, it's likely expected to be found via PATH.
+# We are trying the direct node execution as a fallback.
+YARN_CLI_JS_GLOBAL_NPM_PATH="/c/Users/lupos/AppData/Roaming/npm/node_modules/yarn/bin/yarn.js" # Example for global npm install of yarn
+# Alternative: If yarn puts its main script in its own dir after global install via npm:
+# YARN_SHIM_DIR=$(dirname -- "$(command -v yarn)") # This would find the shim
+# YARN_CLI_JS="$YARN_SHIM_DIR/../node_modules/yarn/bin/yarn.js" # This is a guess
+
+echo "Node executable directory: $NODE_EXEC_PATH"
+echo "Attempting to use npm CLI script: $NPM_CLI_JS"
+# echo "Attempting to use yarn CLI script (example path): $YARN_CLI_JS_GLOBAL_NPM_PATH"
+
+. "$(dirname "$0")/_/husky.sh" # Source Husky's main script
+
+# --- Let's try with npm first as it's more standardly co-located with Node ---
+echo "--- Attempting to run via node: $NODE_EXEC_PATH/node $NPM_CLI_JS run precommit ---"
+"$NODE_EXEC_PATH/node" "$NPM_CLI_JS" run precommit
+COMMAND_EXIT_CODE=$?
+
+# --- If npm fails, and you want to try yarn (ensure YARN_CLI_JS_GLOBAL_NPM_PATH is correct) ---
+# if [ $COMMAND_EXIT_CODE -ne 0 ]; then
+#   echo "npm failed, trying yarn..."
+#   echo "--- Attempting to run via node: $NODE_EXEC_PATH/node $YARN_CLI_JS_GLOBAL_NPM_PATH precommit ---"
+#   # Note: 'yarn precommit' directly, not 'yarn run precommit' like npm
+#   "$NODE_EXEC_PATH/node" "$YARN_CLI_JS_GLOBAL_NPM_PATH" precommit 
+#   COMMAND_EXIT_CODE=$?
+# fi
+
+if [ $COMMAND_EXIT_CODE -eq 0 ]; then
+  echo "--- Precommit command executed successfully ---"
+else
+  echo "--- Precommit command FAILED with exit code $COMMAND_EXIT_CODE ---"
+  exit $COMMAND_EXIT_CODE
+fi
