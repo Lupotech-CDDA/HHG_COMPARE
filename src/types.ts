@@ -348,10 +348,17 @@ export type GunSlot = {
   ups_charges?: number; // int
   blackpowder_tolerance?: number; // int, default: 8
   min_cycle_recoil?: number; // int, default: 0
-  ammo_effects?: string[];
+  ammo_effects?: AmmoEffectEntry[];
   ammo_to_fire?: number; // int, default: 1
-
   valid_mod_locations?: [string, number][]; // [gunmod_location, count]
+  magazine_well_data?: Array<{
+    // If guns can have this directly for internal mags/wells
+    capacity: number;
+    [key: string]: any; // Other properties like type, ammo_restriction etc.
+  }>;
+  charges_per_shot?: number; // For some energy weapons
+  energy_per_shot?: number; // Alternative for energy cost
+  mod_values?: ModValProperty; // If a GUN item itself can have mod_values (less common than on GUNMODs)
 
   modes?: (
     | [string, string, number]
@@ -2131,3 +2138,24 @@ export type GunClassification = {
     | "cbm_mutation"
     | "other_nontrad";
 };
+
+export interface ModValProperty {
+  recoil?: number;
+  handling_modifier?: number;
+  dispersion_modifier?: number;
+  // Add any other properties that can appear in a GUNMOD's "mod_values" object
+  // For example:
+  // damage_modifier?: number; // If mods can directly modify damage this way
+  // new_barrel_length?: string; // etc.
+}
+
+// 2. Define AmmoEffectEntry (element type for ammo_effects array)
+export interface AmmoEffectEntry {
+  id: string;
+  energy_cost?: number;
+  // Add other properties found in ammo_effects objects, e.g.:
+  // damage_type?: string;
+  // intensity?: number;
+  // duration?: number;
+  [key: string]: any; // Allow other properties for flexibility
+}

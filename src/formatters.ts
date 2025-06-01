@@ -1,4 +1,3 @@
-// src/formatters.ts
 import type {
   Item,
   GunSlot,
@@ -7,7 +6,8 @@ import type {
   Translation,
   AmmoSlot,
   GunClassification,
-} from "./types"; // Added GunClassification
+  DamageInstance,
+} from "./types"; // Added GunClassification, DamageInstance
 import {
   parseVolume,
   parseMass,
@@ -21,6 +21,10 @@ import {
   getMagazineIdsFromGunMod,
   getMagazineIdsFromItemPockets,
   getAmmoTypesFromMagazinePockets,
+  // Import types from gunLogic that are used here
+  type FiringModeDetail,
+  type RepresentativeCombatInfo,
+  DEFAULT_REFERENCE_RANGE_TILES, // Import for tooltip consistency
 } from "./gunLogic";
 
 // parseLengthToMm remains here
@@ -104,7 +108,7 @@ export function formatGunBaseRangedDamageDisplay(
   processor: CddaData
 ): string {
   if (!rangedDamage) return "0";
-  const d = normalizeDamageInstance(rangedDamage);
+  const d = normalizeDamageInstance(rangedDamage); // rangedDamage could be undefined, ensure normalize can handle it or check before
   if (!d || d.length === 0 || (d[0] && d[0].amount === 0))
     return "N/A (Relies on Ammo/Mod)";
   return d
@@ -157,6 +161,7 @@ export function formatNumberOrNull(value: number | undefined): number | null {
 }
 
 export function formatModes(modes: GunSlot["modes"] | undefined): string {
+  // This is for base gun modes, not FiringModeDetail
   if (!modes || modes.length === 0) return "N/A";
   return modes.map((mode) => `${mode[1]} (RoF: ${mode[2]})`).join(" / ");
 }
@@ -219,7 +224,8 @@ export function formatFireableAmmoItems(
     if (basicGunProps.flags?.includes("USE_PLAYER_CHARGE"))
       return "Bionic Power";
 
-    if (isItemSubtype("MAGAZINE", entityGun)) {
+    if (isItemSubtype("MAGAZINE", entityGun) && entityGun.pocket_data) {
+      // Added check for pocket_data
       const ammoTypesFromSelf = getAmmoTypesFromMagazinePockets(
         entityGun.pocket_data
       );
@@ -322,4 +328,125 @@ export function formatCategory(
     return "Gun";
   }
   return (entity as any).category || null;
+}
+
+// NEW FORMATTER for Firing Modes column
+export function formatFiringModesForDisplay(
+  modes: FiringModeDetail[] | undefined
+): string | null {
+  if (!modes || modes.length === 0) {
+    return "Semi-auto (1 RoF)"; // Default assumption
+  }
+  return modes
+    .map((mode) => `${mode.name} (${mode.shotsPerActivation} RoF)`)
+    .join(" / ");
+}
+
+// NEW FORMATTER for DPS Tooltip
+export function formatDpsTooltip(
+  combatInfo: RepresentativeCombatInfo | undefined | null
+): string {
+  if (!combatInfo) return "No combat information available.";
+
+  let content = `Calculated for Test Guy (Skills 4, Stats 10).<br>Aiming to 'Regular' threshold with time cost.<br>Simplified accuracy, recoil, and reload factored in.<br><br>`;
+
+  if (combatInfo.isModularVaries) {
+    content +=
+      "<strong>Performance varies based on installed modular parts.</strong>";
+    return content;
+  }
+  if (combatInfo.isRechargeableGun && combatInfo.rechargeableStats) {
+    const stats = combatInfo.rechargeableStats;
+    content += `<strong>Rechargeable Weapon (${stats.energySource}):</strong><br>`;
+    content += `  Damage per Full Charge: ${stats.damagePerFullCharge.toFixed(
+      0
+    )}<br>`;
+    content += `  Shots per Full Charge: ${stats.shotsPerFullCharge}<br>`;
+    content += `  Time to Full Recharge: ${
+      stats.timeToFullRechargeSeconds === Infinity
+        ? "Infinite"
+        : stats.timeToFullRechargeSeconds.toFixed(1) + " sec"
+    }<br>`;
+    // Also show DPH if available
+    if (combatInfo.dphBase > 0 && combatInfo.ammoName) {
+      content += `<br>Base Projectile (if applicable):<br>  ${combatInfo.dphBase.toFixed(
+        0
+      )} ${combatInfo.damageType} / ${
+        combatInfo.ap
+      } AP (${combatInfo.ammoName.substring(0, 10)})<br>`;
+    }
+    return content;
+  }
+  if (combatInfo.isNonConventional && !combatInfo.isRechargeableGun) {
+    // Non-rechargeable, non-conventional (e.g. bows if not given DPS)
+    content += `<strong>Non-Conventional Weapon (${
+      combatInfo.nonConventionalType || ""
+    }):</strong><br>`;
+    content += `Performance not directly comparable via standard DPS metrics here.<br>`;
+    if (combatInfo.dphBase > 0 && combatInfo.ammoName) {
+      // e.g. bows have DPH from ammo
+      content += `<br>Base Projectile:<br>  ${combatInfo.dphBase.toFixed(0)} ${
+        combatInfo.damageType
+      } / ${combatInfo.ap} AP (${combatInfo.ammoName.substring(0, 10)})<br>`;
+    }
+    return content;
+  }
+
+  if (
+    !combatInfo.modePerformances ||
+    combatInfo.modePerformances.length === 0
+  ) {
+    content += "No detailed mode performance data calculated.";
+    if (combatInfo.referenceSustainedDps !== null) {
+      // But we might have a single reference DPS
+      content += `<br>Reference DPS: ${combatInfo.referenceSustainedDps.toFixed(
+        1
+      )} (${combatInfo.referenceModeName || "Default Mode"}) at ${
+        combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
+      } tiles.`;
+    }
+    return content;
+  }
+
+  content += `<strong>Reference Mode: ${
+    combatInfo.referenceModeName || "Default"
+  }</strong> (DPS: ${
+    combatInfo.referenceSustainedDps?.toFixed(1) ?? "N/A"
+  } at ${
+    combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
+  } tiles)<br><br>`;
+
+  const refModePerf = combatInfo.modePerformances.find(
+    (mp) => mp.modeDetails.name === combatInfo.referenceModeName
+  );
+  if (refModePerf) {
+    content += `<u>DPS at various ranges (Reference Mode - ${refModePerf.modeDetails.name}):</u><br>`;
+    refModePerf.dpsAtRanges.forEach((rangeDps) => {
+      content += `  @ ${rangeDps.rangeTiles} tiles: ${
+        rangeDps.sustainedDps?.toFixed(1) ?? "N/A"
+      } DPS<br>`;
+    });
+    content += "<br>";
+  }
+
+  const otherModes = combatInfo.modePerformances.filter(
+    (mp) => mp.modeDetails.name !== combatInfo.referenceModeName
+  );
+  if (otherModes.length > 0) {
+    content += `<u>Performance of other modes at ${
+      combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
+    } tiles:</u><br>`;
+    otherModes.forEach((modePerf) => {
+      const dpsAtRefRange = modePerf.dpsAtRanges.find(
+        (r) =>
+          r.rangeTiles ===
+          (combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES)
+      )?.sustainedDps;
+      content += `  ${modePerf.modeDetails.name} (${
+        modePerf.modeDetails.shotsPerActivation
+      } RoF): ${dpsAtRefRange?.toFixed(1) ?? "N/A"} DPS<br>`;
+    });
+  }
+
+  return content;
 }
