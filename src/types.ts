@@ -635,6 +635,8 @@ export type ItemBasicInfo = {
   stackable?: boolean;
   volume?: volume;
   weight?: mass;
+  barrel_length?: string; // Add if not already present and used by non-modular guns
+  attack_cost?: number; // Add if some base items might have it (though less common for guns)
   longest_side?: string;
   material?: string | string[] | { type: string; portion?: integer }[]; // material_id
   flags?: string | string[];
@@ -2118,3 +2120,14 @@ export function isItemSubtype<Subtype extends ItemSubtypes>(
     (item.type === "ITEM" && (item.subtypes?.includes(subtype) ?? false))
   );
 }
+export type GunClassification = {
+  isVariant: boolean;
+  isNonTraditional: boolean;
+  weaponSubType:
+    | "firearm"
+    | "energy"
+    | "archery"
+    | "chemical"
+    | "cbm_mutation"
+    | "other_nontrad";
+};
