@@ -382,6 +382,7 @@ export type AmmoSlot = {
   effects?: string[];
   critical_multiplier?: number; // float, default: 2
   show_stats?: boolean;
+  explosion?: ExplosionProperties; // Explosion properties if the ammo can cause an explosion
 };
 
 export type ComestibleSlot = {
@@ -634,6 +635,7 @@ export type MessageUseFunction = {
 export type ItemBasicInfo = {
   id: string;
   category?: string; // item_category_id
+  name?: string | Translation;
   color?: string;
   symbol?: string;
   description?: Translation;
@@ -2158,4 +2160,24 @@ export interface AmmoEffectEntry {
   // intensity?: number;
   // duration?: number;
   [key: string]: any; // Allow other properties for flexibility
+}
+
+export interface ShrapnelProperties {
+  // Ensure this is defined
+  casing_mass?: number;
+  fragment_mass?: number;
+  count?: number;
+  damage?: DamageUnit | DamageUnit[];
+  // ... any other shrapnel properties
+}
+
+export interface ExplosionProperties {
+  // Ensure this is defined
+  power?: number;
+  distance_factor?: number | string;
+  fire?: boolean;
+  shrapnel?: ShrapnelProperties;
+  sound_volume?: number;
+  sound_description?: string;
+  // ... any other explosion properties
 }

@@ -15,11 +15,10 @@ import { isItemSubtype } from "./types";
 import {
   getRepresentativeCombatInfo,
   TEST_GUY_PROFILE,
-  DEFAULT_REFERENCE_RANGE_TILES, // Import for label
+  DEFAULT_REFERENCE_RANGE_TILES,
   type RepresentativeCombatInfo,
   type CombatProfile,
   AimingStrategy,
-  // getFiringModeDetails, // Not needed here if availableFiringModes is on combatInfo
   type FiringModeDetail,
 } from "./gunLogic";
 import {
@@ -31,7 +30,6 @@ import {
   formatGunBaseAPDisplay,
   formatModSlots,
   formatMaterial,
-  // formatModes,
   formatFaults,
   formatDefaultMods,
   formatVolumeForSort,
@@ -40,6 +38,12 @@ import {
   formatFiringModesForDisplay,
   formatDpsTooltip,
 } from "./formatters";
+import {
+  log,
+  downloadLogs,
+  clearLogs as clearDebugLogs,
+  getLogsAsString,
+} from "./debugLogger";
 
 export let data: CddaData;
 
@@ -66,8 +70,6 @@ interface ColumnDefinition {
   getSortFilterValue?: (entity: GunWithCombatInfo, processor: CddaData) => any;
   cellClass?: string;
   hasInfoPopup?: boolean;
-  // For header tooltips, this will be a string.
-  // If we had icons in cells, it could be a function (entity) => string
   infoPopupContent?: string;
 }
 
@@ -88,6 +90,9 @@ let showTooltip = false;
 let tooltipContent = "";
 let tooltipX = 0;
 let tooltipY = 0;
+
+let showFullLog = false;
+let fullLogContent = "";
 
 function getNestedValue(obj: any, keyPath: string): any {
   if (!keyPath || !obj) return undefined;
@@ -127,6 +132,7 @@ function classifyGun(
   const gunFlags = (gun as ItemBasicInfo).flags || [];
   const skill = (gun as Item & GunSlot).skill;
   const fireableAmmoDisplayString = formatFireableAmmoItems(gun, processor);
+  const gunNameForLog = getItemNameFromIdOrObject(gun, processor) || gun.id;
 
   if (gunFlags.includes("PSEUDO")) {
     isNonTraditional = true;
@@ -170,7 +176,13 @@ function classifyGun(
       }
     }
   }
-  return { isVariant, isNonTraditional, weaponSubType };
+  const classificationResult = { isVariant, isNonTraditional, weaponSubType };
+  log(
+    "CLASSIFY",
+    `Gun: ${gun.id} (${gunNameForLog}) -> Classified as:`,
+    classificationResult
+  );
+  return classificationResult;
 }
 
 function getGunColumns(): ColumnDefinition[] {
@@ -212,13 +224,11 @@ function getGunColumns(): ColumnDefinition[] {
           })`;
         if (combatInfo.isNonConventional)
           return `Varies (${combatInfo.nonConventionalType || "Non-Conv"})`;
-
         if (
           combatInfo.referenceSustainedDps === null ||
           combatInfo.referenceSustainedDps === undefined
-        ) {
+        )
           return "N/A";
-        }
         const modeStr = combatInfo.referenceModeName
           ? ` (${combatInfo.referenceModeName.substring(0, 10)})`
           : "";
@@ -231,15 +241,13 @@ function getGunColumns(): ColumnDefinition[] {
           combatInfo.isModularVaries ||
           combatInfo.isRechargeableGun ||
           combatInfo.isNonConventional
-        ) {
+        )
           return null;
-        }
         return combatInfo.referenceSustainedDps;
       },
       cellClass: "wrap-text",
       hasInfoPopup: true,
-      // Static string for header tooltip
-      infoPopupContent: `Reference Sustained DPS: Calculated for Test Guy (Skills 4, Stats 10) using a representative conventional ammo, firing mode, and range (typically ${DEFAULT_REFERENCE_RANGE_TILES} tiles). Factors in aiming, accuracy, recoil, and reload. Hover individual cells or use a future detailed view for mode/range breakdowns.`,
+      infoPopupContent: `Reference Sustained DPS: Calculated for Test Guy (Skills 4, Stats 10) using a representative conventional ammo, firing mode, and range (typically ${DEFAULT_REFERENCE_RANGE_TILES} tiles). Factors in aiming, accuracy, recoil, and reload. Special ammo effects (incendiary, explosive) are factored into DPH for the representative ammo if applicable. Full mode/range breakdown will be in a detailed view or enhanced tooltip later.`,
     },
     {
       key: "_calculatedCombatInfo.dphBase",
@@ -266,6 +274,13 @@ function getGunColumns(): ColumnDefinition[] {
         }
         if (combatInfo.dphBase === null || combatInfo.dphBase === undefined)
           return "N/A";
+        let specialSuffix = "";
+        if (combatInfo.debugPrimaryAmmoEffects?.hasIncendiaryEffect)
+          specialSuffix += " (Incendiary)";
+        if (combatInfo.debugPrimaryAmmoEffects?.isExplosive)
+          specialSuffix += ` (Explosive Pwr: ${
+            combatInfo.debugPrimaryAmmoEffects.explosionPower || 0
+          })`;
         return `${combatInfo.dphBase.toFixed(0)} ${
           combatInfo.damageType.split(" ")[0]
         } / ${combatInfo.ap} AP (${(combatInfo.ammoName || "Ammo").substring(
@@ -276,7 +291,7 @@ function getGunColumns(): ColumnDefinition[] {
           combatInfo.barrelMatchInfo !== "Default/Top-level"
             ? "*"
             : ""
-        })`;
+        })${specialSuffix}`;
       },
       getSortFilterValue: (entity: GunWithCombatInfo) => {
         const combatInfo = entity._calculatedCombatInfo;
@@ -287,7 +302,7 @@ function getGunColumns(): ColumnDefinition[] {
       cellClass: "wrap-text",
       hasInfoPopup: true,
       infoPopupContent:
-        "Effective Damage Per Shot (DPH) & Armor Penetration (AP) for a 'standard' conventional fireable ammo. Adjusted for effective barrel length. '*' indicates barrel length adjustment was applied. For some energy/special weapons, this reflects base projectile damage.",
+        "Effective Damage Per Shot (DPH) & Armor Penetration (AP) for a 'standard' conventional fireable ammo. Adjusted for effective barrel length. '*' indicates barrel length adjustment. Special ammo effects (e.g. explosive power, estimated direct shrapnel) are included in DPH. Incendiary effects are noted but fire DoT is not included in DPH/DPS.",
     },
     {
       key: "skill",
@@ -303,7 +318,6 @@ function getGunColumns(): ColumnDefinition[] {
       sortable: false,
       filterable: true,
       formatter: (_val: any, entity: GunWithCombatInfo) => {
-        // _val is not directly used, we get from entity
         return formatFiringModesForDisplay(
           entity._calculatedCombatInfo?.availableFiringModes
         );
@@ -470,6 +484,8 @@ function getGunColumns(): ColumnDefinition[] {
 }
 
 function loadEntitiesForSelectedType() {
+  log("INFO", `Loading entities for type: ${selectedEntityType}`);
+  clearDebugLogs();
   if (!data) {
     allEntitiesForType = [];
     tableColumns = [];
@@ -484,7 +500,7 @@ function loadEntitiesForSelectedType() {
           it.id !== null &&
           isItemSubtype("GUN", it as Item)
       );
-
+    log("INFO", `Found ${rawGunItems.length} raw gun items.`);
     const allVariantIds = new Set<string>();
     rawGunItems.forEach((gun) => {
       const gunSlot = gun as Item & GunSlot;
@@ -492,7 +508,6 @@ function loadEntitiesForSelectedType() {
         gunSlot.variants.forEach((variant) => allVariantIds.add(variant.id));
       }
     });
-
     allEntitiesForType = rawGunItems.map((gun) => {
       const classification = classifyGun(gun, data, allVariantIds);
       const combatInfo = getRepresentativeCombatInfo(
@@ -508,6 +523,10 @@ function loadEntitiesForSelectedType() {
         id: gun.id,
       };
     });
+    log(
+      "INFO",
+      `Processed ${allEntitiesForType.length} guns with combat info.`
+    );
     tableColumns = getGunColumns();
   } else {
     allEntitiesForType = [];
@@ -529,13 +548,22 @@ $: if (data && selectedEntityType) {
 $: {
   if (allEntitiesForType.length > 0 && tableColumns.length > 0) {
     let itemsToDisplay = [...allEntitiesForType];
-
+    log(
+      "FILTER",
+      `Starting filter block. Initial items: ${itemsToDisplay.length}`
+    );
     if (!includeVariants) {
+      const beforeFilter = itemsToDisplay.length;
       itemsToDisplay = itemsToDisplay.filter(
         (entity) => !entity._classification?.isVariant
       );
+      log(
+        "FILTER",
+        `Applied 'Include Variants' (${includeVariants}). Items reduced from ${beforeFilter} to ${itemsToDisplay.length}.`
+      );
     }
     if (!includeNonTraditional) {
+      const beforeFilter = itemsToDisplay.length;
       itemsToDisplay = itemsToDisplay.filter(
         (entity) =>
           !entity._classification?.isNonTraditional &&
@@ -544,15 +572,18 @@ $: {
             !entity._calculatedCombatInfo?.isRechargeableGun
           )
       );
+      log(
+        "FILTER",
+        `Applied 'Include Non-Traditional' (${includeNonTraditional}). Items reduced from ${beforeFilter} to ${itemsToDisplay.length}.`
+      );
     }
-
     let filtered = itemsToDisplay;
-
     for (const colDef of tableColumns) {
       if (colDef.hidden) continue;
-      const filterInput = currentFilters[colDef.key];
-      if (colDef.filterable && filterInput && filterInput.trim() !== "") {
-        const filterValue = filterInput.toLowerCase().trim();
+      const filterVal = currentFilters[colDef.key];
+      if (colDef.filterable && filterVal && filterVal.trim() !== "") {
+        const filterValue = filterVal.toLowerCase().trim();
+        const beforeFilterLength = filtered.length; // Store length before this specific filter
         filtered = filtered.filter((entity: GunWithCombatInfo) => {
           let valueToFilter: string | number | null | undefined;
           if (colDef.key === "_calculatedCombatInfo.referenceSustainedDps")
@@ -584,9 +615,12 @@ $: {
             displayValueForFilter.toLowerCase().startsWith("rechargeable")
           )
             displayValueForFilter = "rechargeable";
-
           return displayValueForFilter.toLowerCase().includes(filterValue);
         });
+        log(
+          "FILTER",
+          `Text filter on '${colDef.label}' with '${filterVal}'. Items reduced from ${beforeFilterLength} to ${filtered.length}.`
+        );
       }
     }
     if (sortState.columnKey) {
@@ -694,7 +728,6 @@ function clearFilter(columnKey: string) {
   currentFilters[columnKey] = "";
   currentFilters = { ...currentFilters };
 }
-
 function getColumnDisplayValue(
   entity: GunWithCombatInfo,
   col: ColumnDefinition,
@@ -705,6 +738,8 @@ function getColumnDisplayValue(
     col.key === "_calculatedCombatInfo.dphBase" ||
     col.key === "_calculatedCombatInfo.availableFiringModes"
   ) {
+    // For these, formatter already takes entity, so _val (first arg to formatter) is not needed.
+    // We pass `getNestedValue(entity, col.key)` as the first arg for consistency, though formatter might ignore it.
     return col.formatter
       ? col.formatter(getNestedValue(entity, col.key), entity, cddaData)
       : "Error";
@@ -716,16 +751,12 @@ function getColumnDisplayValue(
   return formatted ?? "N/A";
 }
 
-// Updated handleInfoHover: 'content' is expected to be a string here
-// If we want dynamic tooltips per cell, we'd call formatDpsTooltip from within the <td>
 function handleInfoHover(
   event: MouseEvent | FocusEvent,
   content: string | undefined
 ) {
-  if (!content) return; // Only show if content is a string
-
-  tooltipContent = content; // Already a string from col.infoPopupContent
-
+  if (!content) return;
+  tooltipContent = content;
   if (event instanceof MouseEvent) {
     tooltipX = event.pageX + 10;
     tooltipY = event.pageY + 10;
@@ -741,9 +772,45 @@ function handleInfoHover(
 function handleInfoLeave() {
   showTooltip = false;
 }
+
+function handleDownloadLogs() {
+  downloadLogs();
+}
+function handleShowFullLog() {
+  fullLogContent = getLogsAsString();
+  showFullLog = true;
+}
+function handleClearDebugLogs() {
+  clearDebugLogs();
+  log("INFO", "Debug logs cleared by user.");
+  if (showFullLog) fullLogContent = getLogsAsString();
+}
 </script>
 
 <div class="comparison-page">
+  <div
+    class="debug-controls"
+    style="padding: 10px; background-color: #333; margin-bottom: 1em;">
+    <button on:click={handleDownloadLogs}>Download Debug Log</button>
+    <button on:click={handleShowFullLog} style="margin-left: 10px;"
+      >Show Full Log in Page</button>
+    <button on:click={handleClearDebugLogs} style="margin-left: 10px;"
+      >Clear Debug Log</button>
+  </div>
+
+  {#if showFullLog}
+    <div
+      class="full-log-display"
+      style="position: fixed; top: 20px; left: 20px; right: 20px; bottom: 20px; background: rgba(0,0,0,0.9); color: #fff; z-index: 2000; overflow: auto; padding: 20px; border: 1px solid #555;">
+      <button
+        on:click={() => (showFullLog = false)}
+        style="position: absolute; top: 5px; right: 5px; padding: 5px 10px;"
+        >Close Log</button>
+      <h3>Full Debug Log:</h3>
+      <pre>{fullLogContent}</pre>
+    </div>
+  {/if}
+
   <div class="entity-selector">
     <button
       class:active={selectedEntityType === "gun"}
@@ -807,7 +874,6 @@ function handleInfoLeave() {
                   title={col.label}>
                   {col.label}
                   {#if col.hasInfoPopup && typeof col.infoPopupContent === "string"}
-                    <!-- Ensure it's a string for header -->
                     <span
                       class="info-icon"
                       on:mouseenter={(e) =>
@@ -839,12 +905,18 @@ function handleInfoLeave() {
                   <td
                     class={col.cellClass ?? ""}
                     title={typeof cellDisplayValue === "string" &&
-                    cellDisplayValue.length > 30 &&
+                    (cellDisplayValue.length > 30 ||
+                      cellDisplayValue.includes("\n")) &&
                     !col.cellClass?.includes("wrap-text")
                       ? cellDisplayValue
                       : ""}>
-                    <!-- If we want cell-specific tooltips for DPS, the icon and logic would go here, calling formatDpsTooltip(entity._calculatedCombatInfo) -->
-                    {cellDisplayValue}<!--
+                    {#if col.cellClass?.includes("wrap-text")}
+                      {@html typeof cellDisplayValue === "string"
+                        ? cellDisplayValue.replace(/\n/g, "<br/>")
+                        : cellDisplayValue}
+                    {:else}
+                      {cellDisplayValue}
+                    {/if}<!--
                     -->{#if col.displayUnit && cellDisplayValue !== "N/A" && typeof cellDisplayValue === "number" && !(String(cellDisplayValue).toLowerCase() === "varies" || String(cellDisplayValue)
                           .toLowerCase()
                           .startsWith("rechargeable"))}
@@ -877,7 +949,7 @@ function handleInfoLeave() {
 </div>
 
 <style>
-/* Styles remain the same */
+/* Styles */
 .comparison-page {
   padding: 1em;
   max-width: 100%;
@@ -1123,7 +1195,6 @@ td:nth-child(9) {
   white-space: normal;
   word-break: break-word;
 }
-/* Adjust subsequent nth-child if Firing Modes is inserted elsewhere */
 th[title="Material"],
 td:nth-child(19) {
   width: 180px;

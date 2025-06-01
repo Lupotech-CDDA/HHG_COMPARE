@@ -1,3 +1,4 @@
+// src/gunLogic.ts
 import type {
   Item,
   GunSlot,
@@ -11,13 +12,18 @@ import type {
   ModValProperty,
   AmmoEffectEntry,
   DamageInstance,
+  ExplosionProperties,
+  ShrapnelProperties,
+  Translation,
 } from "./types";
 import { isItemSubtype } from "./types";
 import { normalizeDamageInstance, CddaData, singularName } from "./data";
 import { parseLengthToMm } from "./formatters";
+import { log } from "./debugLogger";
 
 // --- Interfaces & Constants ---
-// Constants
+export const DEFAULT_REFERENCE_RANGE_TILES = 10;
+const PLAYER_SPEED_MOVES_PER_SECOND = 100;
 const MAX_SKILL = 10;
 const MAX_RECOIL_MOA = 5000;
 const METERS_PER_TILE = 1.0;
@@ -25,11 +31,9 @@ const ACCURACY_CRITICAL_FACTOR = 0.1;
 const ACCURACY_STANDARD_FACTOR = 0.4;
 const ACCURACY_GRAZING_FACTOR = 0.7;
 const GRAZE_DAMAGE_MULTIPLIER_DEFAULT = 0.33;
-const PLAYER_SPEED_MOVES_PER_SECOND = 100;
 const WEAPON_DISPERSION_CONSTANT_FIREARM = 300;
 const MOVES_PER_GAME_SECOND = 100;
 const AMMO_EFFECT_RECHARGE_RATE_KJ_PER_TURN = 0.2;
-
 const STANDARD_AMMO_KEYWORDS = ["fmj", "ball", "standard"];
 const NON_STANDARD_AMMO_KEYWORDS = [
   "+p",
@@ -50,13 +54,11 @@ const NON_STANDARD_AMMO_KEYWORDS = [
   "beanbag",
   "slug",
 ];
-
 const STANDARD_RANGES_TILES = [1, 5, 10, 15, 20, 30];
-export const DEFAULT_REFERENCE_RANGE_TILES = 10; // Export if needed by formatters
 const STANDARD_UPS_CAPACITY_KJ = 500;
 const STANDARD_UPS_SWAP_MOVES = 150;
+const EXPECTED_SHRAPNEL_HIT_PERCENTAGE_ON_EPICENTER_TARGET = 0.15;
 
-// Interfaces
 interface DamageUnitWithBarrels extends DamageUnit {
   barrels?: { barrel_length: string; amount: number }[];
 }
@@ -69,6 +71,11 @@ export interface PotentialDamageInfo {
   barrelMatchInfo?: string;
   ammoCritMultiplier: number;
   pelletCount?: number;
+  hasIncendiaryEffect?: boolean;
+  isExplosive?: boolean;
+  explosionPower?: number;
+  shrapnelCount?: number;
+  shrapnelDamage?: number;
 }
 
 export interface BaseCharacterProfile {
@@ -79,18 +86,15 @@ export interface BaseCharacterProfile {
   weaponSkillLevel: number;
   marksmanshipLevel: number;
 }
-
 export enum AimingStrategy {
   SightDispersionInstantly,
   FixedMovesToRegularAim,
   EstimatedMovesToRegularAim,
 }
-
 export interface CombatProfile extends BaseCharacterProfile {
   aimingStrategy: AimingStrategy;
   fixedAimMoves?: number;
 }
-
 export const TEST_GUY_PROFILE: CombatProfile = {
   strength: 10,
   dexterity: 10,
@@ -101,7 +105,6 @@ export const TEST_GUY_PROFILE: CombatProfile = {
   aimingStrategy: AimingStrategy.FixedMovesToRegularAim,
   fixedAimMoves: 30,
 };
-
 interface ClassifiedAmmoItem {
   item: Item & AmmoSlot;
   isDefaultForAmmoType: boolean;
@@ -109,7 +112,6 @@ interface ClassifiedAmmoItem {
   baseDamageAmount: number;
   pelletCount: number;
 }
-
 export interface FiringModeDetail {
   id: string;
   name: string;
@@ -117,17 +119,14 @@ export interface FiringModeDetail {
   recoilMultiplierFromMode: number;
   hasAccurateShot: boolean;
 }
-
 export interface DpsAtRange {
   rangeTiles: number;
   sustainedDps: number | null;
 }
-
 export interface ModePerformance {
   modeDetails: FiringModeDetail;
   dpsAtRanges: DpsAtRange[];
 }
-
 export interface RechargeableStats {
   damagePerFullCharge: number;
   shotsPerFullCharge: number;
@@ -143,49 +142,78 @@ export interface RepresentativeCombatInfo {
   barrelMatchInfo?: string;
   ammoCritMultiplier: number;
   pelletCount?: number;
-
-  availableFiringModes: FiringModeDetail[]; // ADDED
+  availableFiringModes: FiringModeDetail[];
   modePerformances: ModePerformance[];
-
   referenceSustainedDps: number | null;
   referenceModeName: string | null;
   referenceRangeTiles: number | null;
-
   isRechargeableGun: boolean;
   rechargeableStats?: RechargeableStats;
   isModularVaries?: boolean;
   isNonConventional?: boolean;
   nonConventionalType?: GunClassification["weaponSubType"];
+  debugPrimaryAmmoEffects?: {
+    hasIncendiaryEffect?: boolean;
+    isExplosive?: boolean;
+    explosionPower?: number;
+    shrapnelCount?: number;
+    shrapnelDamage?: number;
+  };
 }
 
-// --- Low-Level Helpers ---
-// ... (getLocalItemNameForLogic, getSummedModProperty, getMultiplicativeModRecoilFactor remain the same) ...
 function getLocalItemNameForLogic(
   itemIdentifier: any,
   processor: CddaData
 ): string | null {
+  if (!itemIdentifier) return null;
+
+  let nameToProcess: string | Translation | undefined = undefined;
+  let idToProcess: string | undefined = undefined;
+
   if (typeof itemIdentifier === "string") {
+    // Attempt to resolve ID to a known object type
     const itemObj =
       processor.byIdMaybe("item", itemIdentifier) ||
       processor.byIdMaybe("ammunition_type", itemIdentifier) ||
       processor.byIdMaybe("damage_type", itemIdentifier);
-    if (itemObj) return singularName(itemObj);
-    return itemIdentifier;
+
+    if (itemObj) {
+      // All these resolved types should conform to something having an 'id' and optionally 'name'
+      // We assume ItemBasicInfo is a common base or that these types have compatible structures.
+      const basicInfo = itemObj as ItemBasicInfo; // Cast to access common fields
+      if (basicInfo.name !== undefined) {
+        nameToProcess = basicInfo.name;
+      }
+      idToProcess = basicInfo.id;
+    } else {
+      return itemIdentifier; // Return the ID itself if no object found
+    }
+  } else if (typeof itemIdentifier === "object" && itemIdentifier !== null) {
+    // Assume itemIdentifier is already an object like Item, AmmunitionType, etc.
+    // which should conform to ItemBasicInfo for name/id.
+    const basicInfo = itemIdentifier as ItemBasicInfo;
+    if (basicInfo.name !== undefined) {
+      nameToProcess = basicInfo.name;
+    }
+    idToProcess = basicInfo.id;
+  } else {
+    return null; // Not a string ID or a valid object
   }
-  if (
-    itemIdentifier &&
-    typeof itemIdentifier === "object" &&
-    itemIdentifier.name
-  )
-    return singularName(itemIdentifier);
-  if (
-    itemIdentifier &&
-    typeof itemIdentifier === "object" &&
-    itemIdentifier.id &&
-    !itemIdentifier.name
-  )
-    return itemIdentifier.id;
-  return null;
+
+  if (nameToProcess) {
+    if (typeof nameToProcess === "string") {
+      return nameToProcess;
+    }
+    // It must be a Translation object if not a string
+    if (typeof nameToProcess === "object") {
+      // This check is now more accurate
+      const nameTrans = nameToProcess as { str_sp?: string; str?: string }; // More specific cast for Translation object shapes
+      if (nameTrans.str_sp) return nameTrans.str_sp;
+      if (nameTrans.str) return nameTrans.str;
+    }
+  }
+
+  return idToProcess || null; // Fallback to ID if name processing fails or no name
 }
 
 function getSummedModProperty(
@@ -245,8 +273,6 @@ function getMultiplicativeModRecoilFactor(
   return totalFactor;
 }
 
-// --- Ammo & Magazine Pocket Logic ---
-// ... (getAmmoTypesFromMagazinePockets, getMagazineIdsFromItemPockets, getAmmoTypesFromGunMod, getMagazineIdsFromGunMod remain the same) ...
 export function getAmmoTypesFromMagazinePockets(
   pockets: PocketData[] | undefined
 ): Set<string> {
@@ -304,8 +330,7 @@ export function getMagazineIdsFromGunMod(modItem: Item): Set<string> {
   }
   return magazineItemIds;
 }
-// --- Gun Property Derivation ---
-// ... (getGunChamberings, getEffectiveBarrelLengthMm remain the same) ...
+
 export function getGunChamberings(
   entityGun: Item,
   processor: CddaData
@@ -360,14 +385,22 @@ export function getEffectiveBarrelLengthMm(
   if (!finalBarrelLengthStr && gunAsBasic.barrel_length) {
     finalBarrelLengthStr = gunAsBasic.barrel_length;
   }
-  return finalBarrelLengthStr ? parseLengthToMm(finalBarrelLengthStr) : null;
+  const lengthMm = finalBarrelLengthStr
+    ? parseLengthToMm(finalBarrelLengthStr)
+    : null;
+  log(
+    "DPH_CALC",
+    `EffectiveBarrelLength for ${gunItem.id}: ${lengthMm}mm (Source: ${
+      finalBarrelLengthStr || "gun direct/none"
+    })`
+  );
+  return lengthMm;
 }
-// --- Firing Mode Details ---
+
 export function getFiringModeDetails(
   gun: Item & GunSlot,
   processor: CddaData
 ): FiringModeDetail[] {
-  // Exported
   const modes: FiringModeDetail[] = [];
   type GunModeTuple = [string, string, number, string[]?];
 
@@ -412,69 +445,164 @@ export function getFiringModeDetails(
       hasAccurateShot: false,
     });
   }
+  log(
+    "DEBUG",
+    `Firing modes for ${gun.id}:`,
+    modes.map((m) => m.name)
+  );
   return modes;
 }
 
-// --- Damage & Ammo Logic ---
-// ... (getAdjustedAmmoDamage, getFireableAmmoObjects, classifyAndSelectStandardAmmo, getRepresentativeDPHInfo remain the same) ...
 export function getAdjustedAmmoDamage(
   ammoItem: Item & AmmoSlot,
   effectiveBarrelLengthMm: number | null,
   processor: CddaData
 ): PotentialDamageInfo | null {
-  if (!ammoItem.damage) return null;
-  const damageInstance = normalizeDamageInstance(ammoItem.damage);
-  if (!damageInstance || damageInstance.length === 0) return null;
+  if (!ammoItem.damage && !ammoItem.explosion) {
+    log(
+      "DPH_CALC",
+      `Ammo ${ammoItem.id} has no direct damage or explosion block. Cannot calculate DPH.`
+    );
+    return null;
+  }
 
-  const primaryDamageUnit = damageInstance[0] as DamageUnitWithBarrels;
-  let chosenDamageAmount = primaryDamageUnit.amount ?? 0;
-  let sourceMatchInfo: string | undefined = "Default/Top-level";
+  let combinedDamage = 0;
+  let primaryDamageType = "N/A";
+  let primaryAp = 0;
+  let critMultiplier = ammoItem.critical_multiplier || 1.0;
+  let barrelMatchInfoStr: string | undefined = "Default/Top-level";
 
-  if (
-    effectiveBarrelLengthMm !== null &&
-    primaryDamageUnit.barrels &&
-    primaryDamageUnit.barrels.length > 0
-  ) {
-    let bestMatchEntry: { barrel_length: string; amount: number } | undefined =
-      undefined;
-    let smallestDiff = Infinity;
-    for (const barrelEntry of primaryDamageUnit.barrels) {
-      const entryLengthMm = parseLengthToMm(barrelEntry.barrel_length);
-      if (entryLengthMm === null) continue;
-      const diff = Math.abs(entryLengthMm - effectiveBarrelLengthMm);
-      if (diff < smallestDiff) {
-        smallestDiff = diff;
-        bestMatchEntry = barrelEntry;
-      } else if (diff === smallestDiff) {
-        if (
-          bestMatchEntry &&
-          parseLengthToMm(bestMatchEntry.barrel_length)! > entryLengthMm
-        ) {
-        } else if (
-          !bestMatchEntry ||
-          entryLengthMm <= effectiveBarrelLengthMm
-        ) {
-          bestMatchEntry = barrelEntry;
+  let hasIncendiary = false;
+  let isExplosiveFlag = false;
+  let explosionPowerVal: number | undefined = undefined;
+  let shrapnelCountVal: number | undefined = undefined;
+  let shrapnelDamageVal: number | undefined = undefined;
+
+  if (ammoItem.damage) {
+    const damageInstance = normalizeDamageInstance(ammoItem.damage);
+    if (damageInstance && damageInstance.length > 0) {
+      const primaryDamageUnit = damageInstance[0] as DamageUnitWithBarrels;
+      let chosenDamageAmount = primaryDamageUnit.amount ?? 0;
+
+      if (
+        effectiveBarrelLengthMm !== null &&
+        primaryDamageUnit.barrels &&
+        primaryDamageUnit.barrels.length > 0
+      ) {
+        let bestMatchEntry:
+          | { barrel_length: string; amount: number }
+          | undefined = undefined;
+        let smallestDiff = Infinity;
+        for (const barrelEntry of primaryDamageUnit.barrels) {
+          const entryLengthMm = parseLengthToMm(barrelEntry.barrel_length);
+          if (entryLengthMm === null) continue;
+          const diff = Math.abs(entryLengthMm - effectiveBarrelLengthMm);
+          if (diff < smallestDiff) {
+            smallestDiff = diff;
+            bestMatchEntry = barrelEntry;
+          } else if (diff === smallestDiff) {
+            if (
+              bestMatchEntry &&
+              parseLengthToMm(bestMatchEntry.barrel_length)! > entryLengthMm
+            ) {
+            } else if (
+              !bestMatchEntry ||
+              entryLengthMm <= effectiveBarrelLengthMm
+            ) {
+              bestMatchEntry = barrelEntry;
+            }
+          }
+        }
+        if (bestMatchEntry) {
+          chosenDamageAmount = bestMatchEntry.amount;
+          barrelMatchInfoStr = `Barrel array (${bestMatchEntry.barrel_length})`;
+        } else {
+          barrelMatchInfoStr = "Default/Top-level (no precise barrel match)";
         }
       }
-    }
-    if (bestMatchEntry) {
-      chosenDamageAmount = bestMatchEntry.amount;
-      sourceMatchInfo = `Barrel array (${bestMatchEntry.barrel_length})`;
-    } else {
-      sourceMatchInfo = "Default/Top-level (no precise barrel match)";
+      combinedDamage += chosenDamageAmount;
+      primaryDamageType =
+        getLocalItemNameForLogic(primaryDamageUnit.damage_type, processor) ||
+        primaryDamageUnit.damage_type;
+      primaryAp = primaryDamageUnit.armor_penetration ?? 0;
+      log(
+        "DPH_CALC",
+        `Ammo ${ammoItem.id} kinetic DPH part: ${chosenDamageAmount} ${primaryDamageType}, AP ${primaryAp}. Barrel: ${barrelMatchInfoStr}`
+      );
     }
   }
+
+  if (ammoItem.explosion) {
+    // Assuming AmmoSlot has explosion?: ExplosionProperties
+    isExplosiveFlag = true;
+    explosionPowerVal = ammoItem.explosion.power || 0;
+    combinedDamage += explosionPowerVal;
+    if (primaryDamageType === "N/A" && explosionPowerVal > 0)
+      primaryDamageType = "explosion";
+    log(
+      "DPH_CALC",
+      `Ammo ${ammoItem.id} explosion DPH part: ${explosionPowerVal} (power). Combined DPH now: ${combinedDamage}`
+    );
+
+    if (ammoItem.explosion.shrapnel) {
+      const shrapnel = ammoItem.explosion.shrapnel;
+      const shrapnelDmgSpec = Array.isArray(shrapnel.damage)
+        ? shrapnel.damage[0]
+        : (shrapnel.damage as DamageUnit | undefined);
+      const shrapnelDmgPerFrag = shrapnelDmgSpec?.amount || 0;
+
+      shrapnelCountVal = shrapnel.count || 0;
+      if (shrapnelCountVal > 0 && shrapnelDmgPerFrag > 0) {
+        const expectedHits = Math.floor(
+          shrapnelCountVal *
+            EXPECTED_SHRAPNEL_HIT_PERCENTAGE_ON_EPICENTER_TARGET
+        );
+        shrapnelDamageVal = expectedHits * shrapnelDmgPerFrag;
+        combinedDamage += shrapnelDamageVal;
+        log(
+          "DPH_CALC",
+          `Ammo ${ammoItem.id} shrapnel DPH part: ${expectedHits} hits * ${shrapnelDmgPerFrag} dmg/frag = ${shrapnelDamageVal}. Combined DPH now: ${combinedDamage}`
+        );
+      }
+    }
+  }
+
+  const effectIds: string[] = [];
+  if (Array.isArray(ammoItem.effects)) {
+    ammoItem.effects.forEach((effect) => {
+      if (typeof effect === "string") {
+        effectIds.push(effect);
+      } else if (typeof effect === "object" && (effect as AmmoEffectEntry).id) {
+        effectIds.push((effect as AmmoEffectEntry).id);
+      }
+    });
+  }
+
+  if (
+    effectIds.includes("INCENDIARY") ||
+    effectIds.includes("NAPALM") ||
+    effectIds.includes("THERMITE")
+  ) {
+    hasIncendiary = true;
+    log(
+      "DPH_CALC",
+      `Ammo ${ammoItem.id} has incendiary effect based on its effects array.`
+    );
+  }
+
   return {
     ammoName: getLocalItemNameForLogic(ammoItem, processor),
-    damage: chosenDamageAmount,
-    damageType:
-      getLocalItemNameForLogic(primaryDamageUnit.damage_type, processor) ||
-      primaryDamageUnit.damage_type,
-    ap: primaryDamageUnit.armor_penetration ?? 0,
-    barrelMatchInfo: sourceMatchInfo,
-    ammoCritMultiplier: ammoItem.critical_multiplier || 1.0,
+    damage: combinedDamage,
+    damageType: primaryDamageType,
+    ap: primaryAp,
+    barrelMatchInfo: barrelMatchInfoStr,
+    ammoCritMultiplier: critMultiplier,
     pelletCount: ammoItem.count || 1,
+    hasIncendiaryEffect: hasIncendiary,
+    isExplosive: isExplosiveFlag,
+    explosionPower: explosionPowerVal,
+    shrapnelCount: shrapnelCountVal,
+    shrapnelDamage: shrapnelDamageVal,
   };
 }
 
@@ -521,8 +649,10 @@ function classifyAndSelectStandardAmmo(
   processor: CddaData
 ): (Item & AmmoSlot) | null {
   const fireableAmmoObjects = getFireableAmmoObjects(gunItem, processor);
-  if (fireableAmmoObjects.length === 0) return null;
-
+  if (fireableAmmoObjects.length === 0) {
+    log("AMMO_SELECT", `No fireable ammo objects found for ${gunItem.id}.`);
+    return null;
+  }
   const conventionalAmmoObjects = fireableAmmoObjects.filter((ammo) => {
     const ammoName = (
       getLocalItemNameForLogic(ammo, processor) || ""
@@ -538,8 +668,22 @@ function classifyAndSelectStandardAmmo(
       return false;
     return true;
   });
-  if (conventionalAmmoObjects.length === 0) return null;
 
+  if (conventionalAmmoObjects.length === 0) {
+    log(
+      "AMMO_SELECT",
+      `No conventional ammo found for ${gunItem.id} from fireable list. Fireable:`,
+      fireableAmmoObjects.map((a) => a.id)
+    );
+    if (fireableAmmoObjects.length > 0) {
+      log(
+        "AMMO_SELECT",
+        `Using first available fireable ammo: ${fireableAmmoObjects[0].id} for ${gunItem.id} as representative (non-conventional).`
+      );
+      return fireableAmmoObjects[0];
+    }
+    return null;
+  }
   const classified: ClassifiedAmmoItem[] = conventionalAmmoObjects.map(
     (ammoItem) => {
       const ammoTypeObj = processor.byIdMaybe(
@@ -572,22 +716,34 @@ function classifyAndSelectStandardAmmo(
     }
   );
 
+  let selectedAmmo: (Item & AmmoSlot) | null = null;
   const defaults = classified.filter((c) => c.isDefaultForAmmoType);
   if (defaults.length > 0) {
     defaults.sort((a, b) => b.baseDamageAmount - a.baseDamageAmount);
-    return defaults[0].item;
+    selectedAmmo = defaults[0].item;
+  } else {
+    const standardsByName = classified.filter((c) => c.isStandardHeuristic);
+    if (standardsByName.length > 0) {
+      standardsByName.sort((a, b) => b.baseDamageAmount - a.baseDamageAmount);
+      selectedAmmo = standardsByName[0].item;
+    } else if (classified.length > 0) {
+      classified.sort((a, b) => b.baseDamageAmount - a.baseDamageAmount);
+      const bestDamage = classified.find((c) => c.baseDamageAmount > 0);
+      selectedAmmo = bestDamage ? bestDamage.item : classified[0].item;
+    }
   }
-  const standardsByName = classified.filter((c) => c.isStandardHeuristic);
-  if (standardsByName.length > 0) {
-    standardsByName.sort((a, b) => b.baseDamageAmount - a.baseDamageAmount);
-    return standardsByName[0].item;
-  }
-  if (classified.length > 0) {
-    classified.sort((a, b) => b.baseDamageAmount - a.baseDamageAmount);
-    const bestDamage = classified.find((c) => c.baseDamageAmount > 0);
-    return bestDamage ? bestDamage.item : classified[0].item;
-  }
-  return null;
+  log(
+    "AMMO_SELECT",
+    `Selected representative ammo for ${gunItem.id}: ${
+      selectedAmmo ? selectedAmmo.id : "None"
+    }`,
+    {
+      fireableCount: fireableAmmoObjects.length,
+      conventionalCount: conventionalAmmoObjects.length,
+      finalSelectionId: selectedAmmo?.id,
+    }
+  );
+  return selectedAmmo;
 }
 
 export function getRepresentativeDPHInfo(
@@ -595,11 +751,22 @@ export function getRepresentativeDPHInfo(
   processor: CddaData
 ): PotentialDamageInfo | null {
   if (!isItemSubtype("GUN", gunItem)) return null;
+  log("DPH_CALC", `Starting DPH info for gun: ${gunItem.id}`);
   const representativeAmmoObject = classifyAndSelectStandardAmmo(
     gunItem,
     processor
   );
-  if (!representativeAmmoObject) return null;
+  if (!representativeAmmoObject) {
+    log(
+      "DPH_CALC",
+      `No representative ammo selected for ${gunItem.id}, cannot get DPH.`
+    );
+    return null;
+  }
+  log(
+    "DPH_CALC",
+    `Using ammo ${representativeAmmoObject.id} for DPH calculation of ${gunItem.id}.`
+  );
   const effectiveBarrelLengthMm = getEffectiveBarrelLengthMm(
     gunItem,
     processor
@@ -610,8 +777,7 @@ export function getRepresentativeDPHInfo(
     processor
   );
 }
-// --- Combat Mechanics (Parameterized by CombatProfile) ---
-// ... (getMovesPerAttackActivation, dispersion_from_skill, getInherentWeaponDispersionMoa, getRecoilAbsorbFactor, getEffectiveGunRecoilQtyPerShot, getIncreaseInRecoilMoaPerShot, getHitProbabilities, estimateMovesToReachRecoil remain the same) ...
+
 export function getMovesPerAttackActivation(
   gunSkillId: string | null,
   profile: BaseCharacterProfile,
@@ -625,15 +791,20 @@ export function getMovesPerAttackActivation(
       min_time: number;
     };
   };
+  let moves = 100;
   if (skillData && skillData.time_to_attack) {
     const { base_time, time_reduction_per_level, min_time } =
       skillData.time_to_attack;
     const calculated = Math.round(
       base_time - time_reduction_per_level * profile.weaponSkillLevel
     );
-    return Math.max(min_time, calculated);
+    moves = Math.max(min_time, calculated);
   }
-  return 100;
+  log(
+    "AIM_CALC",
+    `Moves per attack for skill ${gunSkillId} (lvl ${profile.weaponSkillLevel}): ${moves}`
+  );
+  return moves;
 }
 
 function dispersion_from_skill(
@@ -695,13 +866,26 @@ export function getInherentWeaponDispersionMoa(
     dexModDispersion +
     skillPenaltyDispersion +
     shotSpread;
-  return Math.max(0, sumAdditiveDispersion);
+  const finalDispersion = Math.max(0, sumAdditiveDispersion);
+  log(
+    "AIM_CALC",
+    `Inherent dispersion for ${gunItem.id} w/ ammo ${
+      ammoItem?.id || "N/A"
+    }: ${finalDispersion.toFixed(1)} MOA`,
+    {
+      gunBase: gunItem.dispersion,
+      modBonus: activeDefaultModDispersionBonus,
+      ammoBase: ammoBaseDispersion,
+      dexMod: dexModDispersion,
+      skillPenalty: skillPenaltyDispersion.toFixed(1),
+      shotSpread,
+    }
+  );
+  return finalDispersion;
 }
-
 export function getRecoilAbsorbFactor(profile: BaseCharacterProfile): number {
   return Math.min(profile.weaponSkillLevel, MAX_SKILL) / (MAX_SKILL * 2.0);
 }
-
 export function getEffectiveGunRecoilQtyPerShot(
   gunItem: Item & GunSlot,
   ammoRecoilValue: number,
@@ -711,12 +895,16 @@ export function getEffectiveGunRecoilQtyPerShot(
   activeDefaultModRecoilFactor: number
 ): number {
   let currentRecoil = ammoRecoilValue;
+  const initialAmmoRecoil = currentRecoil;
   const effectiveHandling =
     (gunItem.handling || 0) + activeDefaultModHandlingBonus;
   currentRecoil = Math.max(0, currentRecoil - effectiveHandling * 20);
+  const afterHandlingRecoil = currentRecoil;
   currentRecoil *= activeDefaultModRecoilFactor;
+  const afterModFactorRecoil = currentRecoil;
   const strReduction = profile.strength * 10;
   currentRecoil = Math.max(0, currentRecoil - strReduction);
+  const afterStrRecoil = currentRecoil;
   const gunFlags = (gunItem as ItemBasicInfo).flags || [];
   const hasBipodOnGun = gunFlags.includes("BIPOD");
   let hasBipodOnMod = false;
@@ -726,21 +914,37 @@ export function getEffectiveGunRecoilQtyPerShot(
       return mod && (mod as ItemBasicInfo).flags?.includes("BIPOD");
     });
   }
-  if (hasBipodOnGun || hasBipodOnMod) {
+  const hasBipod = hasBipodOnGun || hasBipodOnMod;
+  if (hasBipod) {
     currentRecoil *= 0.25;
   }
-  return Math.max(0, currentRecoil);
+  const finalRecoil = Math.max(0, currentRecoil);
+  log(
+    "RECOIL_CALC",
+    `Effective recoil for ${gunItem.id}: ${finalRecoil.toFixed(1)}`,
+    {
+      ammoBase: initialAmmoRecoil,
+      gunHandling: gunItem.handling,
+      modHandlingBonus: activeDefaultModHandlingBonus,
+      effectiveHandling,
+      afterHandling: afterHandlingRecoil.toFixed(1),
+      modRecoilFactor: activeDefaultModRecoilFactor.toFixed(2),
+      afterModFactor: afterModFactorRecoil.toFixed(1),
+      str: profile.strength,
+      strReduction,
+      afterStr: afterStrRecoil.toFixed(1),
+      hasBipod,
+      final: finalRecoil.toFixed(1),
+    }
+  );
+  return finalRecoil;
 }
-
 export function getIncreaseInRecoilMoaPerShot(
   effectiveGunRecoilQty: number,
   recoilAbsorbFactor: number
 ): number {
-  const recoilIncreaseImmediate =
-    effectiveGunRecoilQty * (1.0 - recoilAbsorbFactor);
-  return recoilIncreaseImmediate * 5.0;
+  return effectiveGunRecoilQty * (1.0 - recoilAbsorbFactor) * 5.0;
 }
-
 export function getHitProbabilities(
   effectiveTotalDispersionMoa: number,
   targetAngularSizeMoa: number,
@@ -750,11 +954,9 @@ export function getHitProbabilities(
     return { P_Crit: 0, P_Hit: 0, P_Graze: 0, P_Miss: 1.0 };
   if (effectiveTotalDispersionMoa <= 0)
     return { P_Crit: 1.0, P_Hit: 0, P_Graze: 0, P_Miss: 0 };
-
   const critThresholdAngle = targetAngularSizeMoa * accuracyConstants.crit;
   const hitThresholdAngle = targetAngularSizeMoa * accuracyConstants.standard;
   const grazeThresholdAngle = targetAngularSizeMoa * accuracyConstants.graze;
-
   let pCrit = Math.max(
     0,
     Math.min(1.0, critThresholdAngle / effectiveTotalDispersionMoa)
@@ -767,14 +969,11 @@ export function getHitProbabilities(
     0,
     Math.min(1.0, grazeThresholdAngle / effectiveTotalDispersionMoa)
   );
-
   let pHit = pHitTotal - pCrit;
   let pGraze = pGrazeTotal - pHitTotal;
-
   pCrit = Math.max(0, pCrit);
   pHit = Math.max(0, pHit);
   pGraze = Math.max(0, pGraze);
-
   const sumP = pCrit + pHit + pGraze;
   if (sumP > 1.0 && sumP > 0.0001) {
     pCrit /= sumP;
@@ -788,7 +987,6 @@ export function getHitProbabilities(
     P_Miss: Math.max(0, 1.0 - (pCrit + pHit + pGraze)),
   };
 }
-
 function estimateMovesToReachRecoil(
   gunItem: Item & GunSlot,
   targetRecoilMoa: number,
@@ -797,7 +995,6 @@ function estimateMovesToReachRecoil(
   hasAccurateShotMode: boolean
 ): number {
   if (startRecoilMoa <= targetRecoilMoa) return 0;
-
   const sightDispersion = gunItem.sight_dispersion || 300;
   const baseAimRate = 300 - Math.min(sightDispersion, 280);
   const perBonus = (profile.perception - 8) * 10;
@@ -805,35 +1002,45 @@ function estimateMovesToReachRecoil(
     ((profile.weaponSkillLevel + profile.marksmanshipLevel) / 2) * 5;
   let simplifiedAimPerMovePer10Moves = baseAimRate / 10 + perBonus + skillBonus;
   let simplifiedAimPerMove = Math.max(5, simplifiedAimPerMovePer10Moves / 10);
-
-  if (hasAccurateShotMode) {
-    simplifiedAimPerMove *= 1.2;
-  }
+  if (hasAccurateShotMode) simplifiedAimPerMove *= 1.2;
   if (simplifiedAimPerMove <= 0) return 500;
-
   let currentRecoil = startRecoilMoa;
   let movesSpent = 0;
   const MAX_AIM_MOVES = 200;
-
   while (currentRecoil > targetRecoilMoa && movesSpent < MAX_AIM_MOVES) {
     currentRecoil -= simplifiedAimPerMove;
     if (currentRecoil < sightDispersion * 1.5) simplifiedAimPerMove *= 0.8;
     simplifiedAimPerMove = Math.max(0.1, simplifiedAimPerMove);
     movesSpent++;
-    if (simplifiedAimPerMove <= 0.01 && currentRecoil > targetRecoilMoa) {
+    if (simplifiedAimPerMove <= 0.01 && currentRecoil > targetRecoilMoa)
       return MAX_AIM_MOVES;
-    }
   }
   return Math.max(0, movesSpent);
 }
-// --- Main Calculation Orchestrator ---
+
 export function getRepresentativeCombatInfo(
   gunItem: Item,
   processor: CddaData,
   profile: CombatProfile,
   classification: GunClassification
 ): RepresentativeCombatInfo | null {
-  if (!isItemSubtype("GUN", gunItem)) return null;
+  log(
+    "INFO",
+    `Starting getRepresentativeCombatInfo for: ${
+      gunItem.id
+    } (${getLocalItemNameForLogic(gunItem, processor)})`,
+    { classification }
+  );
+
+  let refSustainedDps: number | null = null;
+  let refModeName: string | null = null;
+  let refRangeTiles: number | null = null;
+  let rechargeableData: RechargeableStats | undefined = undefined;
+
+  if (!isItemSubtype("GUN", gunItem)) {
+    log("WARN", `Item ${gunItem.id} is not a GUN. Aborting.`);
+    return null;
+  }
   const gunProps = gunItem as Item & GunSlot;
   const basicGunProps = gunItem as ItemBasicInfo;
 
@@ -851,24 +1058,45 @@ export function getRepresentativeCombatInfo(
     gunProps,
     processor
   );
+  log(
+    "DEBUG",
+    `Mod bonuses for ${
+      gunItem.id
+    }: DispBonus=${activeDefaultModDispersionBonus}, HandleBonus=${activeDefaultModHandlingBonus}, RecoilFactor=${activeDefaultModRecoilFactor.toFixed(
+      2
+    )}`
+  );
 
   const dphInfo = getRepresentativeDPHInfo(gunItem, processor);
-  const firingModes = getFiringModeDetails(gunProps, processor); // Get this early
+  const firingModes = getFiringModeDetails(gunProps, processor);
+
+  let debugPrimaryAmmoEffects: RepresentativeCombatInfo["debugPrimaryAmmoEffects"] =
+    {};
+  if (dphInfo) {
+    debugPrimaryAmmoEffects = {
+      hasIncendiaryEffect: dphInfo.hasIncendiaryEffect,
+      isExplosive: dphInfo.isExplosive,
+      explosionPower: dphInfo.explosionPower,
+      shrapnelCount: dphInfo.shrapnelCount,
+      shrapnelDamage: dphInfo.shrapnelDamage,
+    };
+  }
 
   let isRechargeable = false;
-  let rechargeableData: RechargeableStats | undefined = undefined;
   let effectiveMagCapacityOverride: number | null = null;
   let effectiveReloadTimeOverride: number | null = null;
   let energySourceForRechargeable: string = "Internal Battery";
 
-  const hasInternalRechargeEffect = gunProps.ammo_effects?.some(
+  const ammoEffectsArray = Array.isArray(gunProps.ammo_effects)
+    ? gunProps.ammo_effects
+    : [];
+  const hasInternalRechargeEffect = ammoEffectsArray.some(
     (ae: AmmoEffectEntry) => ae.id === "RECHARGE_INTERNAL_BATTERY"
   );
 
   if (hasInternalRechargeEffect) {
     isRechargeable = true;
     energySourceForRechargeable = "Internal Battery";
-
     const ammoCapacityKj =
       gunProps.magazine_well_data?.[0]?.capacity ||
       (gunProps.pocket_data?.[0]?.ammo_restriction && gunProps.ammo
@@ -879,8 +1107,7 @@ export function getRepresentativeCombatInfo(
           ]?.[0]
         : 0) ||
       0;
-
-    const effectEntry = gunProps.ammo_effects?.find(
+    const effectEntry = ammoEffectsArray.find(
       (ae: AmmoEffectEntry) => ae.id === "RECHARGE_INTERNAL_BATTERY"
     );
     const energyCostPerShot =
@@ -890,17 +1117,14 @@ export function getRepresentativeCombatInfo(
       1;
     const rechargeRateKjPerTurn = AMMO_EFFECT_RECHARGE_RATE_KJ_PER_TURN;
 
-    if (
-      ammoCapacityKj > 0 &&
-      energyCostPerShot > 0 &&
-      dphInfo &&
-      dphInfo.damage > 0
-    ) {
+    if (ammoCapacityKj > 0 && energyCostPerShot > 0) {
       const shots = Math.floor(ammoCapacityKj / energyCostPerShot);
       rechargeableData = {
         shotsPerFullCharge: shots,
         damagePerFullCharge:
-          shots * dphInfo.damage * (dphInfo.pelletCount || 1),
+          dphInfo && dphInfo.damage > 0
+            ? shots * dphInfo.damage * (dphInfo.pelletCount || 1)
+            : 0,
         timeToFullRechargeSeconds:
           rechargeRateKjPerTurn > 0
             ? Math.ceil(
@@ -909,10 +1133,29 @@ export function getRepresentativeCombatInfo(
             : Infinity,
         energySource: energySourceForRechargeable,
       };
+    } else {
+      rechargeableData = {
+        shotsPerFullCharge: 0,
+        damagePerFullCharge: 0,
+        timeToFullRechargeSeconds: Infinity,
+        energySource: energySourceForRechargeable,
+      };
     }
+    log(
+      "DPS_CYCLE",
+      `${gunItem.id} identified as internally rechargeable.`,
+      rechargeableData
+    );
   } else if (basicGunProps.flags?.includes("USE_PLAYER_CHARGE")) {
     isRechargeable = true;
     energySourceForRechargeable = "Bionic Power";
+    rechargeableData = {
+      shotsPerFullCharge: Infinity,
+      damagePerFullCharge: Infinity,
+      timeToFullRechargeSeconds: 0,
+      energySource: energySourceForRechargeable,
+    };
+    log("DPS_CYCLE", `${gunItem.id} identified as using Bionic Power.`);
   }
 
   if (isRechargeable) {
@@ -924,16 +1167,17 @@ export function getRepresentativeCombatInfo(
       barrelMatchInfo: dphInfo?.barrelMatchInfo,
       ammoCritMultiplier: dphInfo?.ammoCritMultiplier || 1.0,
       pelletCount: dphInfo?.pelletCount || 1,
-      availableFiringModes: firingModes, // ADDED
+      availableFiringModes: firingModes,
       modePerformances: [],
-      referenceSustainedDps: null,
-      referenceModeName: null,
-      referenceRangeTiles: null,
+      referenceSustainedDps: refSustainedDps,
+      referenceModeName: refModeName,
+      referenceRangeTiles: refRangeTiles,
       isRechargeableGun: true,
       rechargeableStats: rechargeableData,
       isModularVaries: false,
       isNonConventional: true,
       nonConventionalType: classification.weaponSubType,
+      debugPrimaryAmmoEffects,
     };
   }
 
@@ -945,7 +1189,15 @@ export function getRepresentativeCombatInfo(
       );
       effectiveReloadTimeOverride = STANDARD_UPS_SWAP_MOVES;
     }
+    log(
+      "DPS_CYCLE",
+      `${gunItem.id} identified as UPS powered. Eff. Mag Cap: ${effectiveMagCapacityOverride}, Reload Time: ${effectiveReloadTimeOverride}`
+    );
     if (!dphInfo && classification.weaponSubType === "energy") {
+      log(
+        "DPS_CYCLE",
+        `${gunItem.id} is UPS energy weapon, returning simplified info.`
+      );
       let gunDmgNormalized: DamageUnit[] = [];
       if (gunProps.ranged_damage) {
         gunDmgNormalized = normalizeDamageInstance(gunProps.ranged_damage);
@@ -969,15 +1221,16 @@ export function getRepresentativeCombatInfo(
         ap: ap,
         ammoCritMultiplier: 1.0,
         pelletCount: 1,
-        availableFiringModes: firingModes, // ADDED
+        availableFiringModes: firingModes,
         modePerformances: [],
-        referenceSustainedDps: null,
-        referenceModeName: null,
-        referenceRangeTiles: null,
+        referenceSustainedDps: refSustainedDps,
+        referenceModeName: refModeName,
+        referenceRangeTiles: refRangeTiles,
         isRechargeableGun: false,
         isNonConventional: true,
         nonConventionalType: "energy",
         isModularVaries: false,
+        debugPrimaryAmmoEffects,
       };
     }
   }
@@ -990,6 +1243,10 @@ export function getRepresentativeCombatInfo(
       gunProps.ammo.length === 0) &&
     !effectiveMagCapacityOverride
   ) {
+    log(
+      "DPS_CYCLE",
+      `${gunItem.id} is Varies (Modular) - no chamberings/ammo and not UPS. Skipping full DPS calc.`
+    );
     return {
       ammoName: "Varies (Modular)",
       dphBase: 0,
@@ -997,17 +1254,31 @@ export function getRepresentativeCombatInfo(
       ap: 0,
       ammoCritMultiplier: 1,
       pelletCount: 1,
-      availableFiringModes: firingModes, // ADDED
+      availableFiringModes: firingModes,
       modePerformances: [],
-      referenceSustainedDps: null,
-      referenceModeName: null,
-      referenceRangeTiles: null,
+      referenceSustainedDps: refSustainedDps,
+      referenceModeName: refModeName,
+      referenceRangeTiles: refRangeTiles,
       isRechargeableGun: false,
       isModularVaries: true,
+      debugPrimaryAmmoEffects,
     };
   }
+
   if (!dphInfo || dphInfo.damage <= 0) {
+    log(
+      "WARN",
+      `No valid DPH info or DPH is zero for ${gunItem.id} (Ammo: ${
+        dphInfo?.ammoName
+      }). Rep Ammo from DPHInfo fn: ${
+        getRepresentativeDPHInfo(gunItem, processor)?.ammoName
+      }`
+    );
     if (classification.isNonTraditional) {
+      log(
+        "DPS_CYCLE",
+        `${gunItem.id} is Non-Traditional with no DPH. Skipping full DPS calc.`
+      );
       return {
         ammoName:
           classification.weaponSubType === "archery" ? "Arrow/Bolt" : "Special",
@@ -1016,24 +1287,40 @@ export function getRepresentativeCombatInfo(
         ap: 0,
         ammoCritMultiplier: 1,
         pelletCount: 1,
-        availableFiringModes: firingModes, // ADDED
+        availableFiringModes: firingModes,
         modePerformances: [],
-        referenceSustainedDps: null,
-        referenceModeName: null,
-        referenceRangeTiles: null,
+        referenceSustainedDps: refSustainedDps,
+        referenceModeName: refModeName,
+        referenceRangeTiles: refRangeTiles,
         isRechargeableGun: false,
         isNonConventional: true,
         nonConventionalType: classification.weaponSubType,
         isModularVaries: false,
+        debugPrimaryAmmoEffects,
       };
     }
+    log(
+      "ERROR",
+      `Cannot calculate DPS for ${gunItem.id} due to missing/zero DPH for presumably conventional weapon.`
+    );
     return null;
   }
+  log(
+    "DPS_CYCLE",
+    `Gun ${gunItem.id} with ammo ${
+      dphInfo.ammoName
+    }: DPH=${dphInfo.damage.toFixed(1)}, AP=${dphInfo.ap}, CritX=${
+      dphInfo.ammoCritMultiplier
+    }, Pellets=${dphInfo.pelletCount}`
+  );
 
   const allModePerformances: ModePerformance[] = [];
 
   for (const mode of firingModes) {
-    // firingModes already fetched
+    log(
+      "DPS_CYCLE",
+      `Calculating for mode: ${mode.name} (RoF ${mode.shotsPerActivation}) on ${gunItem.id}`
+    );
     const dpsAtEachRangeForThisMode: DpsAtRange[] = [];
     const movesPerAttackActivation = getMovesPerAttackActivation(
       gunProps.skill,
@@ -1064,6 +1351,14 @@ export function getRepresentativeCombatInfo(
       );
       initialEffectiveRecoilMoaForFirstShot = thresholdRegularAimMoa;
     }
+    log(
+      "DPS_CYCLE",
+      `  Mode ${
+        mode.name
+      }: InitialAimMoves=${movesSpentAimingInitial}, InitialRecoilMOA=${initialEffectiveRecoilMoaForFirstShot.toFixed(
+        1
+      )}`
+    );
 
     let magCapacityUsed: number | null =
       effectiveMagCapacityOverride ?? gunProps.clip_size ?? null;
@@ -1114,6 +1409,10 @@ export function getRepresentativeCombatInfo(
       }
     }
     if (magCapacityUsed === null || magCapacityUsed <= 0) {
+      log(
+        "WARN",
+        `No magazine capacity found for ${gunItem.id} in mode ${mode.name}. Skipping mode DPS.`
+      );
       dpsAtEachRangeForThisMode.push(
         ...STANDARD_RANGES_TILES.map((r) => ({
           rangeTiles: r,
@@ -1126,6 +1425,10 @@ export function getRepresentativeCombatInfo(
       });
       continue;
     }
+    log(
+      "DPS_CYCLE",
+      `  Mode ${mode.name}: MagCapUsed=${magCapacityUsed}, MovesPerActivation=${movesPerAttackActivation}`
+    );
 
     const selectedAmmoObject = getFireableAmmoObjects(gunItem, processor).find(
       (ammo) => getLocalItemNameForLogic(ammo, processor) === dphInfo.ammoName
@@ -1152,6 +1455,16 @@ export function getRepresentativeCombatInfo(
         gunRecoilQtyPerShotBase,
         recoilAbsorbFactor
       ) * mode.recoilMultiplierFromMode;
+    log(
+      "DPS_CYCLE",
+      `  Mode ${mode.name}: InherentDisp=${inherentWeaponDispersionMoa.toFixed(
+        1
+      )}, RecoilQtyBase=${gunRecoilQtyPerShotBase.toFixed(
+        1
+      )}, RecoilIncreasePerShot=${increaseInRecoilMoaPerShotForThisMode.toFixed(
+        1
+      )} (mode mult ${mode.recoilMultiplierFromMode})`
+    );
 
     const accuracyConstants = {
       crit: ACCURACY_CRITICAL_FACTOR,
@@ -1167,6 +1480,7 @@ export function getRepresentativeCombatInfo(
             (180.0 / Math.PI) *
             60.0
           : MAX_RECOIL_MOA * 2;
+      // log('DPS_CYCLE', `  Range ${range}t: TargetSizeMOA=${targetAngularSizeMoa.toFixed(1)}`); // Can be too verbose
       let totalExpectedDamagePerMagCycle = 0;
       let currentRecoilLevelMoa = initialEffectiveRecoilMoaForFirstShot;
       const pelletCount = dphInfo.pelletCount || 1;
@@ -1194,6 +1508,21 @@ export function getRepresentativeCombatInfo(
           expectedDamageThisShot += expectedDamageThisPellet;
         }
         totalExpectedDamagePerMagCycle += expectedDamageThisShot;
+        if (
+          (i === 0 || i === magCapacityUsed - 1 || i % 10 === 0) &&
+          magCapacityUsed > 5
+        ) {
+          log(
+            "HIT_PROB",
+            `    Shot ${i + 1} (${gunItem.id}/${
+              mode.name
+            }): RecoilMOA=${currentRecoilLevelMoa.toFixed(
+              1
+            )}, EffDisp=${effectiveDispersionThisShotMoa.toFixed(
+              1
+            )}, ExpDmgThisShot=${expectedDamageThisShot.toFixed(1)}`
+          );
+        }
       }
 
       const activationsToEmptyMag = Math.ceil(
@@ -1215,6 +1544,14 @@ export function getRepresentativeCombatInfo(
         rangeTiles: range,
         sustainedDps: rawSustainedDps,
       });
+      log(
+        "DPS_CYCLE",
+        `  Mode ${
+          mode.name
+        } @ ${range}t: TotalExpectedDmg=${totalExpectedDamagePerMagCycle.toFixed(
+          1
+        )}, CycleMoves=${totalMovesPerCycle}, DPS=${rawSustainedDps.toFixed(1)}`
+      );
     }
     allModePerformances.push({
       modeDetails: mode,
@@ -1222,10 +1559,7 @@ export function getRepresentativeCombatInfo(
     });
   }
 
-  let refSustainedDps: number | null = null;
-  let refModeName: string | null = null;
-  let refRangeTiles: number | null = null;
-
+  // Determine reference DPS (already initialized to null)
   for (const perf of allModePerformances) {
     const dpsAtRefRange = perf.dpsAtRanges.find(
       (r) => r.rangeTiles === DEFAULT_REFERENCE_RANGE_TILES
@@ -1238,7 +1572,8 @@ export function getRepresentativeCombatInfo(
       }
     }
   }
-  if (refSustainedDps === null) {
+  if (refSustainedDps === null && allModePerformances.length > 0) {
+    // Fallback if no DPS at default reference range
     for (const perf of allModePerformances) {
       for (const rangeDps of perf.dpsAtRanges) {
         if (
@@ -1257,6 +1592,14 @@ export function getRepresentativeCombatInfo(
       }
     }
   }
+  log(
+    "INFO",
+    `Finished getRepresentativeCombatInfo for: ${
+      gunItem.id
+    }. Ref DPS: ${refSustainedDps?.toFixed(1)} using mode ${
+      refModeName || "N/A"
+    } at ${refRangeTiles || "N/A"}t`
+  );
 
   return {
     ammoName: dphInfo.ammoName,
@@ -1266,7 +1609,7 @@ export function getRepresentativeCombatInfo(
     barrelMatchInfo: dphInfo.barrelMatchInfo,
     ammoCritMultiplier: dphInfo.ammoCritMultiplier,
     pelletCount: dphInfo.pelletCount,
-    availableFiringModes: firingModes, // ADDED
+    availableFiringModes: firingModes,
     modePerformances: allModePerformances,
     referenceSustainedDps: refSustainedDps,
     referenceModeName: refModeName,
@@ -1275,5 +1618,6 @@ export function getRepresentativeCombatInfo(
     isModularVaries: false,
     isNonConventional: classification.isNonTraditional,
     nonConventionalType: classification.weaponSubType,
+    debugPrimaryAmmoEffects: debugPrimaryAmmoEffects,
   };
 }
