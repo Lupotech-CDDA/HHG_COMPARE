@@ -12,15 +12,24 @@ import type {
   GunClassification,
 } from "./types";
 import { isItemSubtype } from "./types";
+
+// Imports from new/refactored gun logic files
+import {
+  type FiringModeDetail, // From gunProperties, used by formatFiringModesForDisplay
+} from "./gunProperties";
+import {
+  type CombatProfile,
+  AimingStrategy, // From combatMechanics
+} from "./combatMechanics";
 import {
   getRepresentativeCombatInfo,
   TEST_GUY_PROFILE,
-  DEFAULT_REFERENCE_RANGE_TILES,
-  type RepresentativeCombatInfo,
-  type CombatProfile,
-  AimingStrategy,
-  type FiringModeDetail,
-} from "./gunLogic";
+  type RepresentativeCombatInfo, // From gunDPS
+} from "./gunDPS";
+import {
+  DEFAULT_REFERENCE_RANGE_TILES, // From gameConstants
+} from "./gameConstants";
+
 import {
   getItemNameFromIdOrObject,
   formatFireableAmmoItems,
@@ -70,7 +79,7 @@ interface ColumnDefinition {
   getSortFilterValue?: (entity: GunWithCombatInfo, processor: CddaData) => any;
   cellClass?: string;
   hasInfoPopup?: boolean;
-  infoPopupContent?: string;
+  infoPopupContent?: string | ((entity: GunWithCombatInfo) => string);
 }
 
 let selectedEntityType: EntityType = "gun";
@@ -128,11 +137,10 @@ function classifyGun(
   let isVariant = allVariantIds.has(gun.id);
   let isNonTraditional = false;
   let weaponSubType: GunClassification["weaponSubType"] = "firearm";
-
+  const gunNameForLog = getItemNameFromIdOrObject(gun, processor) || gun.id;
   const gunFlags = (gun as ItemBasicInfo).flags || [];
   const skill = (gun as Item & GunSlot).skill;
   const fireableAmmoDisplayString = formatFireableAmmoItems(gun, processor);
-  const gunNameForLog = getItemNameFromIdOrObject(gun, processor) || gun.id;
 
   if (gunFlags.includes("PSEUDO")) {
     isNonTraditional = true;
@@ -211,43 +219,79 @@ function getGunColumns(): ColumnDefinition[] {
     },
     {
       key: "_calculatedCombatInfo.referenceSustainedDps",
-      label: `Ref. DPS (${DEFAULT_REFERENCE_RANGE_TILES}t)`,
+      label: `Sust. DPS (${DEFAULT_REFERENCE_RANGE_TILES}t)`,
+      sortable: true,
+      filterable: true,
+      formatter: (_val: any, entity: GunWithCombatInfo) => {
+        const ci = entity._calculatedCombatInfo;
+        if (!ci) return "N/A";
+        if (ci.isModularVaries) return "Varies";
+        if (ci.isRechargeableGun) return `Recharge`;
+        if (ci.isNonConventional)
+          return `N/C (${ci.nonConventionalType?.substring(0, 4) || ""})`;
+        if (
+          ci.referenceSustainedDps === null ||
+          ci.referenceSustainedDps === undefined
+        )
+          return "N/A";
+        return `${ci.referenceSustainedDps.toFixed(1)}`;
+      },
+      getSortFilterValue: (entity: GunWithCombatInfo) =>
+        entity._calculatedCombatInfo?.referenceSustainedDps,
+      cellClass: "wrap-text",
+      hasInfoPopup: true,
+      infoPopupContent: (entity: GunWithCombatInfo) =>
+        formatDpsTooltip(entity._calculatedCombatInfo),
+    },
+    {
+      key: "_calculatedCombatInfo.dpsMagDumpNoReload",
+      label: "DPS (Mag Dump)",
       sortable: true,
       filterable: false,
       formatter: (_val: any, entity: GunWithCombatInfo) => {
-        const combatInfo = entity._calculatedCombatInfo;
-        if (!combatInfo) return "N/A";
-        if (combatInfo.isModularVaries) return "Varies (Modular)";
-        if (combatInfo.isRechargeableGun)
-          return `Rechargeable (${
-            combatInfo.rechargeableStats?.energySource || "Special"
-          })`;
-        if (combatInfo.isNonConventional)
-          return `Varies (${combatInfo.nonConventionalType || "Non-Conv"})`;
+        const ci = entity._calculatedCombatInfo;
         if (
-          combatInfo.referenceSustainedDps === null ||
-          combatInfo.referenceSustainedDps === undefined
+          !ci ||
+          ci.isModularVaries ||
+          ci.isRechargeableGun ||
+          ci.isNonConventional
         )
-          return "N/A";
-        const modeStr = combatInfo.referenceModeName
-          ? ` (${combatInfo.referenceModeName.substring(0, 10)})`
-          : "";
-        return `${combatInfo.referenceSustainedDps.toFixed(1)}${modeStr}`;
+          return "";
+        return ci.dpsMagDumpNoReload !== null
+          ? ci.dpsMagDumpNoReload.toFixed(1)
+          : "N/A";
       },
-      getSortFilterValue: (entity: GunWithCombatInfo) => {
-        const combatInfo = entity._calculatedCombatInfo;
-        if (
-          !combatInfo ||
-          combatInfo.isModularVaries ||
-          combatInfo.isRechargeableGun ||
-          combatInfo.isNonConventional
-        )
-          return null;
-        return combatInfo.referenceSustainedDps;
-      },
+      getSortFilterValue: (entity: GunWithCombatInfo) =>
+        entity._calculatedCombatInfo?.dpsMagDumpNoReload,
       cellClass: "wrap-text",
       hasInfoPopup: true,
-      infoPopupContent: `Reference Sustained DPS: Calculated for Test Guy (Skills 4, Stats 10) using a representative conventional ammo, firing mode, and range (typically ${DEFAULT_REFERENCE_RANGE_TILES} tiles). Factors in aiming, accuracy, recoil, and reload. Special ammo effects (incendiary, explosive) are factored into DPH for the representative ammo if applicable. Full mode/range breakdown will be in a detailed view or enhanced tooltip later.`,
+      infoPopupContent:
+        "DPS emptying one magazine (after initial aim), NO reload time included. Uses reference mode/ammo and default range.",
+    },
+    {
+      key: "_calculatedCombatInfo.dpsPreciseAimPerShotNoReload",
+      label: "DPS (Precise/Shot)",
+      sortable: true,
+      filterable: false,
+      formatter: (_val: any, entity: GunWithCombatInfo) => {
+        const ci = entity._calculatedCombatInfo;
+        if (
+          !ci ||
+          ci.isModularVaries ||
+          ci.isRechargeableGun ||
+          ci.isNonConventional
+        )
+          return "";
+        return ci.dpsPreciseAimPerShotNoReload !== null
+          ? ci.dpsPreciseAimPerShotNoReload.toFixed(1)
+          : "N/A";
+      },
+      getSortFilterValue: (entity: GunWithCombatInfo) =>
+        entity._calculatedCombatInfo?.dpsPreciseAimPerShotNoReload,
+      cellClass: "wrap-text",
+      hasInfoPopup: true,
+      infoPopupContent:
+        "DPS emptying one magazine, performing a full 'Precise Aim' (to gun's effective sight dispersion) before EACH shot. NO reload time included. Uses reference mode/ammo and default range.",
     },
     {
       key: "_calculatedCombatInfo.dphBase",
@@ -255,54 +299,35 @@ function getGunColumns(): ColumnDefinition[] {
       sortable: true,
       filterable: false,
       formatter: (_val: any, entity: GunWithCombatInfo) => {
-        const combatInfo = entity._calculatedCombatInfo;
-        if (!combatInfo) return "N/A";
-        if (combatInfo.isModularVaries) return "Varies (Modular)";
-        if (
-          combatInfo.isRechargeableGun &&
-          (!combatInfo.dphBase || combatInfo.dphBase === 0)
-        ) {
-          return `Rechargeable (${
-            combatInfo.rechargeableStats?.energySource || "Special"
-          })`;
-        }
-        if (
-          combatInfo.isNonConventional &&
-          (!combatInfo.dphBase || combatInfo.dphBase === 0)
-        ) {
-          return `Varies (${combatInfo.nonConventionalType || "Non-Conv"})`;
-        }
-        if (combatInfo.dphBase === null || combatInfo.dphBase === undefined)
-          return "N/A";
+        const ci = entity._calculatedCombatInfo;
+        if (!ci) return "N/A";
+        if (ci.isModularVaries) return "Varies";
+        if (ci.isRechargeableGun && (!ci.dphBase || ci.dphBase === 0))
+          return `Recharge`;
+        if (ci.isNonConventional && (!ci.dphBase || ci.dphBase === 0))
+          return `N/C`;
+        if (ci.dphBase === null || ci.dphBase === undefined) return "N/A";
         let specialSuffix = "";
-        if (combatInfo.debugPrimaryAmmoEffects?.hasIncendiaryEffect)
-          specialSuffix += " (Incendiary)";
-        if (combatInfo.debugPrimaryAmmoEffects?.isExplosive)
-          specialSuffix += ` (Explosive Pwr: ${
-            combatInfo.debugPrimaryAmmoEffects.explosionPower || 0
+        if (ci.debugPrimaryAmmoEffects?.hasIncendiaryEffect)
+          specialSuffix += " (Inc)";
+        if (ci.debugPrimaryAmmoEffects?.isExplosive)
+          specialSuffix += ` (Exp P:${
+            ci.debugPrimaryAmmoEffects.explosionPower || 0
           })`;
-        return `${combatInfo.dphBase.toFixed(0)} ${
-          combatInfo.damageType.split(" ")[0]
-        } / ${combatInfo.ap} AP (${(combatInfo.ammoName || "Ammo").substring(
-          0,
-          10
-        )}${
-          combatInfo.barrelMatchInfo &&
-          combatInfo.barrelMatchInfo !== "Default/Top-level"
+        return `${ci.dphBase.toFixed(0)} ${ci.damageType.substring(0, 4)}/${
+          ci.ap
+        }AP (${(ci.ammoName || "").substring(0, 7)}${
+          ci.barrelMatchInfo && ci.barrelMatchInfo !== "Default/Top-level"
             ? "*"
             : ""
         })${specialSuffix}`;
       },
-      getSortFilterValue: (entity: GunWithCombatInfo) => {
-        const combatInfo = entity._calculatedCombatInfo;
-        return combatInfo && !combatInfo.isModularVaries && combatInfo.dphBase
-          ? combatInfo.dphBase
-          : null;
-      },
+      getSortFilterValue: (entity: GunWithCombatInfo) =>
+        entity._calculatedCombatInfo?.dphBase,
       cellClass: "wrap-text",
       hasInfoPopup: true,
       infoPopupContent:
-        "Effective Damage Per Shot (DPH) & Armor Penetration (AP) for a 'standard' conventional fireable ammo. Adjusted for effective barrel length. '*' indicates barrel length adjustment. Special ammo effects (e.g. explosive power, estimated direct shrapnel) are included in DPH. Incendiary effects are noted but fire DoT is not included in DPH/DPS.",
+        "Effective Damage Per Hit (DPH) & Armor Penetration (AP) for rep. ammo. '*' = barrel adjust. Special effects factored if applicable. Fire DoT not included in DPH/DPS.",
     },
     {
       key: "skill",
@@ -317,16 +342,14 @@ function getGunColumns(): ColumnDefinition[] {
       label: "Firing Modes (RoF)",
       sortable: false,
       filterable: true,
-      formatter: (_val: any, entity: GunWithCombatInfo) => {
-        return formatFiringModesForDisplay(
+      formatter: (_val: any, entity: GunWithCombatInfo) =>
+        formatFiringModesForDisplay(
           entity._calculatedCombatInfo?.availableFiringModes
-        );
-      },
-      getSortFilterValue: (entity: GunWithCombatInfo) => {
-        return formatFiringModesForDisplay(
+        ),
+      getSortFilterValue: (entity: GunWithCombatInfo) =>
+        formatFiringModesForDisplay(
           entity._calculatedCombatInfo?.availableFiringModes
-        );
-      },
+        ),
       cellClass: "wrap-text",
     },
     {
@@ -583,12 +606,16 @@ $: {
       const filterVal = currentFilters[colDef.key];
       if (colDef.filterable && filterVal && filterVal.trim() !== "") {
         const filterValue = filterVal.toLowerCase().trim();
-        const beforeFilterLength = filtered.length; // Store length before this specific filter
+        const beforeFilterLength = filtered.length;
         filtered = filtered.filter((entity: GunWithCombatInfo) => {
           let valueToFilter: string | number | null | undefined;
-          if (colDef.key === "_calculatedCombatInfo.referenceSustainedDps")
-            valueToFilter = entity._calculatedCombatInfo?.referenceSustainedDps;
-          else if (colDef.key === "_calculatedCombatInfo.dphBase")
+          if (
+            colDef.key === "_calculatedCombatInfo.referenceSustainedDps" ||
+            colDef.key === "_calculatedCombatInfo.dpsMagDumpNoReload" ||
+            colDef.key === "_calculatedCombatInfo.dpsPreciseAimPerShotNoReload"
+          ) {
+            valueToFilter = getNestedValue(entity, colDef.key);
+          } else if (colDef.key === "_calculatedCombatInfo.dphBase")
             valueToFilter = entity._calculatedCombatInfo?.dphBase;
           else {
             valueToFilter = colDef.getSortFilterValue
@@ -615,6 +642,11 @@ $: {
             displayValueForFilter.toLowerCase().startsWith("rechargeable")
           )
             displayValueForFilter = "rechargeable";
+          if (
+            typeof displayValueForFilter === "string" &&
+            displayValueForFilter.toLowerCase().startsWith("n/c")
+          )
+            displayValueForFilter = "n/c";
           return displayValueForFilter.toLowerCase().includes(filterValue);
         });
         log(
@@ -631,20 +663,24 @@ $: {
         filtered.sort((a: GunWithCombatInfo, b: GunWithCombatInfo) => {
           let valA: any, valB: any;
           if (
-            sortColumnDef.key === "_calculatedCombatInfo.referenceSustainedDps"
+            sortColumnDef.key ===
+              "_calculatedCombatInfo.referenceSustainedDps" ||
+            sortColumnDef.key === "_calculatedCombatInfo.dpsMagDumpNoReload" ||
+            sortColumnDef.key ===
+              "_calculatedCombatInfo.dpsPreciseAimPerShotNoReload"
           ) {
             valA =
               a._calculatedCombatInfo?.isModularVaries ||
               a._calculatedCombatInfo?.isRechargeableGun ||
               a._calculatedCombatInfo?.isNonConventional
                 ? -Infinity
-                : a._calculatedCombatInfo?.referenceSustainedDps;
+                : getNestedValue(a, sortColumnDef.key);
             valB =
               b._calculatedCombatInfo?.isModularVaries ||
               b._calculatedCombatInfo?.isRechargeableGun ||
               b._calculatedCombatInfo?.isNonConventional
                 ? -Infinity
-                : b._calculatedCombatInfo?.referenceSustainedDps;
+                : getNestedValue(b, sortColumnDef.key);
           } else if (sortColumnDef.key === "_calculatedCombatInfo.dphBase") {
             valA =
               a._calculatedCombatInfo?.isModularVaries ||
@@ -728,21 +764,16 @@ function clearFilter(columnKey: string) {
   currentFilters[columnKey] = "";
   currentFilters = { ...currentFilters };
 }
+
 function getColumnDisplayValue(
   entity: GunWithCombatInfo,
   col: ColumnDefinition,
   cddaData: CddaData
 ) {
-  if (
-    col.key === "_calculatedCombatInfo.referenceSustainedDps" ||
-    col.key === "_calculatedCombatInfo.dphBase" ||
-    col.key === "_calculatedCombatInfo.availableFiringModes"
-  ) {
-    // For these, formatter already takes entity, so _val (first arg to formatter) is not needed.
-    // We pass `getNestedValue(entity, col.key)` as the first arg for consistency, though formatter might ignore it.
+  if (col.key.startsWith("_calculatedCombatInfo.")) {
     return col.formatter
       ? col.formatter(getNestedValue(entity, col.key), entity, cddaData)
-      : "Error";
+      : "Error formatting";
   }
   const rawValue = getNestedValue(entity, col.key);
   const formatted = col.formatter
@@ -753,10 +784,44 @@ function getColumnDisplayValue(
 
 function handleInfoHover(
   event: MouseEvent | FocusEvent,
-  content: string | undefined
+  contentOrCallback:
+    | string
+    | ((entity: GunWithCombatInfo) => string)
+    | undefined,
+  entityForRow?: GunWithCombatInfo
 ) {
-  if (!content) return;
-  tooltipContent = content;
+  if (!contentOrCallback) return;
+  let finalContent: string;
+  if (typeof contentOrCallback === "function") {
+    if (
+      !entityForRow &&
+      event.currentTarget &&
+      (event.currentTarget as HTMLElement).closest("td")
+    ) {
+      // This is a fallback if entityForRow wasn't passed but we are likely in a cell context
+      // This part is tricky and might need a more robust way to get the entity if not passed.
+      // For now, if entityForRow is needed by a function, it MUST be passed.
+      log(
+        "WARN",
+        "Tooltip content is a function but no entity was provided. Header tooltips should be strings."
+      );
+      const colDef = tableColumns.find(
+        (c) => c.infoPopupContent === contentOrCallback
+      ); // Not reliable to find col this way
+      finalContent = colDef
+        ? `General info for ${colDef.label}`
+        : "Detailed information requires row context.";
+    } else if (entityForRow) {
+      finalContent = contentOrCallback(entityForRow);
+    } else {
+      // It's a function, but no entity available (likely a header icon that shouldn't have a function tooltip)
+      finalContent = "General column information.";
+    }
+  } else {
+    finalContent = contentOrCallback;
+  }
+  if (!finalContent) return;
+  tooltipContent = finalContent;
   if (event instanceof MouseEvent) {
     tooltipX = event.pageX + 10;
     tooltipY = event.pageY + 10;
@@ -787,24 +852,23 @@ function handleClearDebugLogs() {
 }
 </script>
 
+// src/ComparisonPage.svelte
 <div class="comparison-page">
   <div
     class="debug-controls"
-    style="padding: 10px; background-color: #333; margin-bottom: 1em;">
+    style="padding: 10px; background-color: #333; margin-bottom: 1em; display: flex; gap: 10px; flex-wrap: wrap;">
     <button on:click={handleDownloadLogs}>Download Debug Log</button>
-    <button on:click={handleShowFullLog} style="margin-left: 10px;"
-      >Show Full Log in Page</button>
-    <button on:click={handleClearDebugLogs} style="margin-left: 10px;"
-      >Clear Debug Log</button>
+    <button on:click={handleShowFullLog}>Show Full Log in Page</button>
+    <button on:click={handleClearDebugLogs}>Clear Debug Log</button>
   </div>
 
   {#if showFullLog}
     <div
       class="full-log-display"
-      style="position: fixed; top: 20px; left: 20px; right: 20px; bottom: 20px; background: rgba(0,0,0,0.9); color: #fff; z-index: 2000; overflow: auto; padding: 20px; border: 1px solid #555;">
+      style="position: fixed; top: 20px; left: 20px; right: 20px; bottom: 20px; background: rgba(0,0,0,0.95); color: #ddd; z-index: 2000; overflow: auto; padding: 20px; border: 1px solid #555; font-family: monospace; font-size: 0.8em;">
       <button
         on:click={() => (showFullLog = false)}
-        style="position: absolute; top: 5px; right: 5px; padding: 5px 10px;"
+        style="position: absolute; top: 5px; right: 5px; padding: 5px 10px; background: #555; color: white; border: none; cursor: pointer;"
         >Close Log</button>
       <h3>Full Debug Log:</h3>
       <pre>{fullLogContent}</pre>
@@ -873,13 +937,26 @@ function handleClearDebugLogs() {
                   class:sortable={col.sortable}
                   title={col.label}>
                   {col.label}
-                  {#if col.hasInfoPopup && typeof col.infoPopupContent === "string"}
+                  {#if col.hasInfoPopup}
                     <span
                       class="info-icon"
                       on:mouseenter={(e) =>
-                        handleInfoHover(e, col.infoPopupContent)}
+                        handleInfoHover(
+                          e,
+                          typeof col.infoPopupContent === "string"
+                            ? col.infoPopupContent
+                            : `Info for ${col.label}`,
+                          undefined
+                        )}
                       on:mouseleave={handleInfoLeave}
-                      on:focus={(e) => handleInfoHover(e, col.infoPopupContent)}
+                      on:focus={(e) =>
+                        handleInfoHover(
+                          e,
+                          typeof col.infoPopupContent === "string"
+                            ? col.infoPopupContent
+                            : `Info for ${col.label}`,
+                          undefined
+                        )}
                       on:blur={handleInfoLeave}
                       tabindex="0"
                       role="button"
@@ -906,10 +983,23 @@ function handleClearDebugLogs() {
                     class={col.cellClass ?? ""}
                     title={typeof cellDisplayValue === "string" &&
                     (cellDisplayValue.length > 30 ||
-                      cellDisplayValue.includes("\n")) &&
+                      (cellDisplayValue.includes &&
+                        cellDisplayValue.includes("\n"))) &&
                     !col.cellClass?.includes("wrap-text")
                       ? cellDisplayValue
-                      : ""}>
+                      : ""}
+                    on:mouseenter={(e) => {
+                      if (typeof col.infoPopupContent === "function")
+                        handleInfoHover(e, col.infoPopupContent, entity);
+                    }}
+                    on:focus={(e) => {
+                      if (typeof col.infoPopupContent === "function")
+                        handleInfoHover(e, col.infoPopupContent, entity);
+                    }}
+                    on:mouseleave={(e) => {
+                      if (typeof col.infoPopupContent === "function")
+                        handleInfoLeave();
+                    }}>
                     {#if col.cellClass?.includes("wrap-text")}
                       {@html typeof cellDisplayValue === "string"
                         ? cellDisplayValue.replace(/\n/g, "<br/>")
@@ -919,7 +1009,9 @@ function handleClearDebugLogs() {
                     {/if}<!--
                     -->{#if col.displayUnit && cellDisplayValue !== "N/A" && typeof cellDisplayValue === "number" && !(String(cellDisplayValue).toLowerCase() === "varies" || String(cellDisplayValue)
                           .toLowerCase()
-                          .startsWith("rechargeable"))}
+                          .startsWith("rechargeable") || String(cellDisplayValue)
+                          .toLowerCase()
+                          .startsWith("n/c"))}
                       {" " + col.displayUnit}
                     {/if}
                   </td>
@@ -949,7 +1041,6 @@ function handleClearDebugLogs() {
 </div>
 
 <style>
-/* Styles */
 .comparison-page {
   padding: 1em;
   max-width: 100%;
@@ -998,8 +1089,8 @@ function handleClearDebugLogs() {
   overflow-x: auto;
   border: 1px solid #303030;
   border-radius: 3px;
-  max-height: calc(100vh - 15em);
-}
+  max-height: calc(100vh - 18em);
+} /* Adjusted max-height for debug controls */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1141,82 +1232,127 @@ td:empty::after {
   font-size: 0.85em;
   white-space: pre-wrap;
   z-index: 1000;
-  max-width: 400px;
+  max-width: 450px;
   pointer-events: none;
 }
+.debug-controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px;
+  background-color: #1e1e1e;
+  margin-bottom: 1em;
+  border-radius: 4px;
+}
+.debug-controls button {
+  padding: 0.4em 0.8em;
+  font-size: 0.9em;
+}
+.full-log-display {
+  position: fixed;
+  top: 10vh;
+  left: 10vw;
+  right: 10vw;
+  bottom: 10vh;
+  width: 80vw;
+  height: 80vh;
+  background: rgba(20, 20, 20, 0.97);
+  color: #e0e0e0;
+  z-index: 2000;
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid #444;
+  box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+  font-family: monospace;
+  font-size: 0.8em;
+  border-radius: 5px;
+}
+.full-log-display pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
 
+/* Column Widths - Adjust indices based on final column order! */
+/* Order: Name, ID, Cat, Sust DPS, MagDump DPS, Precise DPS, DPH, Skill, Modes, Ammo, Mags, ... */
 th[title="Name"],
 td:nth-child(1) {
-  width: 200px;
-  white-space: normal;
-  word-break: break-word;
+  width: 160px;
 }
 th[title="ID"],
 td:nth-child(2) {
-  width: 150px;
+  width: 120px;
 }
 th[title="Category"],
 td:nth-child(3) {
-  width: 150px;
-  white-space: normal;
-  word-break: break-word;
+  width: 110px;
 }
-th[title^="Ref. DPS"],
+th[title^="Sust. DPS"],
 td:nth-child(4) {
-  width: 140px;
-  white-space: normal;
-  word-break: break-word;
+  width: 90px;
+}
+th[title^="DPS (Mag Dump)"],
+td:nth-child(5) {
+  width: 90px;
+}
+th[title^="DPS (Precise/Shot)"],
+td:nth-child(6) {
+  width: 90px;
 }
 th[title^="Effective Dmg"],
-td:nth-child(5) {
-  width: 160px;
-  white-space: normal;
-  word-break: break-word;
+td:nth-child(7) {
+  width: 140px;
 }
 th[title="Skill"],
-td:nth-child(6) {
-  width: 100px;
+td:nth-child(8) {
+  width: 70px;
 }
 th[title^="Firing Modes"],
-td:nth-child(7) {
-  width: 180px;
-  white-space: normal;
-  word-break: break-word;
+td:nth-child(9) {
+  width: 140px;
 }
 th[title="Fireable Ammo Items"],
-td:nth-child(8) {
-  width: 250px;
-  white-space: normal;
-  word-break: break-word;
+td:nth-child(10) {
+  width: 180px;
 }
 th[title="Magazines"],
-td:nth-child(9) {
-  width: 250px;
-  white-space: normal;
-  word-break: break-word;
+td:nth-child(11) {
+  width: 180px;
+}
+/* The default width will apply to columns from 12 onwards, adjust as necessary */
+/* Example: Base Dmg, Base AP, Range, Dispersion, Recoil, Loudness, Reload, Clip, Durability */
+td:nth-child(12),
+td:nth-child(13),
+td:nth-child(14),
+td:nth-child(15),
+td:nth-child(16),
+td:nth-child(17),
+td:nth-child(18),
+td:nth-child(19),
+td:nth-child(20) {
+  width: 80px; /* A smaller default for numeric stats */
 }
 th[title="Material"],
-td:nth-child(19) {
-  width: 180px;
-  white-space: normal;
-  word-break: break-word;
-}
-th[title="Mod Slots"],
+td:nth-child(21) {
+  width: 120px;
+} /* Adjusted index */
+th[title="Volume"],
 td:nth-child(22) {
-  width: 200px;
-  white-space: normal;
-  word-break: break-word;
-}
-th[title="Default Mods"],
+  width: 70px;
+} /* Adjusted index */
+th[title="Weight"],
 td:nth-child(23) {
-  width: 200px;
-  white-space: normal;
-  word-break: break-word;
-}
-th[title="Possible Faults"],
+  width: 70px;
+} /* Adjusted index */
+th[title="Mod Slots"],
 td:nth-child(24) {
-  width: 200px;
-  white-space: normal;
-  word-break: break-word;
-}
+  width: 150px;
+} /* Adjusted index */
+th[title="Default Mods"],
+td:nth-child(25) {
+  width: 150px;
+} /* Adjusted index */
+th[title="Possible Faults"],
+td:nth-child(26) {
+  width: 150px;
+} /* Adjusted index */
 </style>

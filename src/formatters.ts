@@ -1,3 +1,4 @@
+// src/formatters.ts
 import type {
   Item,
   GunSlot,
@@ -7,7 +8,7 @@ import type {
   AmmoSlot,
   GunClassification,
   DamageInstance,
-} from "./types"; // Added GunClassification, DamageInstance
+} from "./types";
 import {
   parseVolume,
   parseMass,
@@ -16,25 +17,35 @@ import {
   normalizeDamageInstance,
 } from "./data";
 import { isItemSubtype } from "./types";
+
+// Import types from gun logic files
+import type {
+  FiringModeDetail, // from gunProperties
+} from "./gunProperties";
+import type {
+  RepresentativeCombatInfo,
+  DpsCalculationDetails, // from gunDPS
+  ModePerformance,
+  DpsAtRange, // from gunDPS
+} from "./gunDPS";
+import {
+  DEFAULT_REFERENCE_RANGE_TILES, // from gameConstants (or gunDPS if re-exported)
+} from "./gameConstants";
+
+// Import helper functions from gunProperties that are used by formatters here
 import {
   getFireableAmmoObjects,
   getMagazineIdsFromGunMod,
   getMagazineIdsFromItemPockets,
   getAmmoTypesFromMagazinePockets,
-  // Import types from gunLogic that are used here
-  type FiringModeDetail,
-  type RepresentativeCombatInfo,
-  DEFAULT_REFERENCE_RANGE_TILES, // Import for tooltip consistency
-} from "./gunLogic";
+} from "./gunProperties";
 
-// parseLengthToMm remains here
 export function parseLengthToMm(lengthStr: string | undefined): number | null {
   if (!lengthStr) return null;
   const parts = String(lengthStr).trim().toLowerCase().split(/\s+/);
-  if (parts.length !== 2) {
-    if (parts.length === 1 && !isNaN(parseFloat(parts[0]))) {
-      /* Allow unitless */
-    } else return null;
+  if (parts.length === 1 && !isNaN(parseFloat(parts[0]))) {
+  } else if (parts.length !== 2) {
+    return null;
   }
   const value = parseFloat(parts[0]);
   const unit = parts.length === 2 ? parts[1] : "mm";
@@ -59,6 +70,10 @@ export function getItemNameFromIdOrObject(
   itemIdentifier: any,
   processor: CddaData
 ): string | null {
+  if (!itemIdentifier) return null;
+  let nameProp: string | Translation | undefined;
+  let idProp: string | undefined;
+
   if (typeof itemIdentifier === "string") {
     const itemObj =
       processor.byIdMaybe("item", itemIdentifier) ||
@@ -68,38 +83,40 @@ export function getItemNameFromIdOrObject(
       processor.byIdMaybe("material", itemIdentifier) ||
       processor.byIdMaybe("damage_type", itemIdentifier) ||
       processor.byIdMaybe("fault", itemIdentifier);
-    if (itemObj) return singularName(itemObj);
-    if (itemIdentifier.startsWith("group:")) return itemIdentifier;
-    return itemIdentifier;
+    if (itemObj) {
+      nameProp = (itemObj as ItemBasicInfo).name;
+      idProp = (itemObj as ItemBasicInfo).id;
+    } else {
+      if (itemIdentifier.startsWith("group:")) return itemIdentifier;
+      return itemIdentifier;
+    }
+  } else if (typeof itemIdentifier === "object" && itemIdentifier !== null) {
+    nameProp = (itemIdentifier as ItemBasicInfo).name;
+    idProp = (itemIdentifier as ItemBasicInfo).id;
+  } else {
+    return null;
   }
-  if (
-    itemIdentifier &&
-    typeof itemIdentifier === "object" &&
-    itemIdentifier.name
-  ) {
-    return singularName(itemIdentifier);
+
+  if (nameProp) {
+    if (typeof nameProp === "string") return nameProp;
+    if (typeof nameProp === "object") {
+      const nameTrans = nameProp as { str_sp?: string; str?: string };
+      return nameTrans.str_sp || nameTrans.str || idProp || "Unnamed";
+    }
   }
-  if (
-    itemIdentifier &&
-    typeof itemIdentifier === "object" &&
-    itemIdentifier.id &&
-    !itemIdentifier.name
-  ) {
-    return itemIdentifier.id;
-  }
-  return null;
+  return idProp || "Unknown ID";
 }
 
 export function formatVolumeForSort(
   value: ItemBasicInfo["volume"]
 ): number | null {
-  if (value === undefined) return null;
+  if (value === undefined || value === null) return null;
   return parseVolume(value) / 1000;
 }
 export function formatWeightForSort(
   value: ItemBasicInfo["weight"]
 ): number | null {
-  if (value === undefined) return null;
+  if (value === undefined || value === null) return null;
   return parseMass(value) / 1000;
 }
 
@@ -108,9 +125,9 @@ export function formatGunBaseRangedDamageDisplay(
   processor: CddaData
 ): string {
   if (!rangedDamage) return "0";
-  const d = normalizeDamageInstance(rangedDamage); // rangedDamage could be undefined, ensure normalize can handle it or check before
-  if (!d || d.length === 0 || (d[0] && d[0].amount === 0))
-    return "N/A (Relies on Ammo/Mod)";
+  const d = normalizeDamageInstance(rangedDamage);
+  if (!d || d.length === 0 || (d[0] && d[0].amount === 0 && d.length === 1))
+    return "N/A (Ammo/Mod)";
   return d
     .map(
       (i) =>
@@ -125,7 +142,8 @@ export function formatGunBaseAPDisplay(
 ): number | null {
   if (!rangedDamage) return 0;
   const d = normalizeDamageInstance(rangedDamage);
-  if (!d || d.length === 0 || (d[0] && d[0].amount === 0)) return null;
+  if (!d || d.length === 0 || (d[0] && d[0].amount === 0 && d.length === 1))
+    return null;
   return d[0]?.armor_penetration ?? 0;
 }
 export function formatModSlots(
@@ -156,15 +174,17 @@ export function formatMaterial(
   }
   return String(material);
 }
-export function formatNumberOrNull(value: number | undefined): number | null {
+export function formatNumberOrNull(
+  value: number | undefined | null
+): number | null {
   return value ?? null;
 }
 
-export function formatModes(modes: GunSlot["modes"] | undefined): string {
-  // This is for base gun modes, not FiringModeDetail
-  if (!modes || modes.length === 0) return "N/A";
-  return modes.map((mode) => `${mode[1]} (RoF: ${mode[2]})`).join(" / ");
+export function formatGunModes(modes: GunSlot["modes"] | undefined): string {
+  if (!modes || modes.length === 0) return "Semi-auto (1)";
+  return modes.map((mode) => `${mode[1]} (${mode[2]})`).join(" / ");
 }
+
 export function formatFaults(
   faults: ItemBasicInfo["faults"] | undefined,
   processor: CddaData
@@ -208,10 +228,13 @@ export function formatFireableAmmoItems(
   processor: CddaData
 ): string | null {
   if (!isItemSubtype("GUN", entityGun)) return null;
+
   const fireableAmmoObjects = getFireableAmmoObjects(entityGun, processor);
+
   const fireableAmmoItemNames = new Set(
     fireableAmmoObjects.map(
-      (obj) => getItemNameFromIdOrObject(obj, processor) || obj.id
+      (obj: Item & AmmoSlot) =>
+        getItemNameFromIdOrObject(obj, processor) || obj.id
     )
   );
 
@@ -225,7 +248,6 @@ export function formatFireableAmmoItems(
       return "Bionic Power";
 
     if (isItemSubtype("MAGAZINE", entityGun) && entityGun.pocket_data) {
-      // Added check for pocket_data
       const ammoTypesFromSelf = getAmmoTypesFromMagazinePockets(
         entityGun.pocket_data
       );
@@ -330,25 +352,78 @@ export function formatCategory(
   return (entity as any).category || null;
 }
 
-// NEW FORMATTER for Firing Modes column
 export function formatFiringModesForDisplay(
   modes: FiringModeDetail[] | undefined
 ): string | null {
   if (!modes || modes.length === 0) {
-    return "Semi-auto (1 RoF)"; // Default assumption
+    return "Semi-auto (1 RoF)";
   }
   return modes
     .map((mode) => `${mode.name} (${mode.shotsPerActivation} RoF)`)
     .join(" / ");
 }
 
-// NEW FORMATTER for DPS Tooltip
+function formatDpsDetails(
+  details: DpsCalculationDetails | undefined,
+  type: string
+): string {
+  if (!details) return "";
+  let detailStr = `    <em>${type} Cycle:</em><br>`;
+  detailStr += `      Dmg: ${details.totalExpectedDamage.toFixed(
+    1
+  )}, Time: ${details.timeCycleSec.toFixed(2)}s<br>`;
+  if (
+    details.aimingMoves !== undefined ||
+    details.firingMoves !== undefined ||
+    details.reloadMoves !== undefined
+  ) {
+    detailStr += `        Moves: `;
+    const moveParts = [];
+    if (details.aimingMoves !== undefined)
+      moveParts.push(`Aim ${details.aimingMoves}`);
+    if (details.firingMoves !== undefined)
+      moveParts.push(`Fire ${details.firingMoves}`);
+    if (details.reloadMoves !== undefined)
+      moveParts.push(`Reload ${details.reloadMoves}`);
+    detailStr += moveParts.join(", ") + "mv<br>";
+  }
+  // Check if avgAimingMovesPerPreciseShot exists and is a number before formatting
+  const avgAimMoves = (details as any).avgAimingMovesPerPreciseShot;
+  if (typeof avgAimMoves === "number") {
+    detailStr += `        Avg Aim/Shot: ${avgAimMoves.toFixed(0)}mv<br>`;
+  }
+  return detailStr;
+}
+
 export function formatDpsTooltip(
   combatInfo: RepresentativeCombatInfo | undefined | null
 ): string {
   if (!combatInfo) return "No combat information available.";
 
-  let content = `Calculated for Test Guy (Skills 4, Stats 10).<br>Aiming to 'Regular' threshold with time cost.<br>Simplified accuracy, recoil, and reload factored in.<br><br>`;
+  let content = `<strong>Test Guy Profile:</strong> Skills @4, Stats @10.<br>`;
+  if (combatInfo.ammoName) {
+    content += `<strong>Rep. Ammo:</strong> ${combatInfo.ammoName}`;
+    if (combatInfo.pelletCount && combatInfo.pelletCount > 1) {
+      content += ` (${combatInfo.pelletCount} pellets)`;
+    }
+    content += `<br>`;
+  }
+  if (combatInfo.debugPrimaryAmmoEffects) {
+    const effects = combatInfo.debugPrimaryAmmoEffects;
+    if (effects.hasIncendiaryEffect)
+      content += `<span style="color: orange;">Effect: Incendiary</span><br>`;
+    if (effects.isExplosive) {
+      content += `<span style="color: red;">Effect: Explosive (Power: ${
+        effects.explosionPower || 0
+      }`;
+      if (effects.shrapnelCount)
+        content += `, Frags: ${effects.shrapnelCount} (Exp.Dmg: ${
+          effects.shrapnelDamage?.toFixed(0) || 0
+        })`;
+      content += `)</span><br>`;
+    }
+  }
+  content += `<hr style='margin: 5px 0;'>`;
 
   if (combatInfo.isModularVaries) {
     content +=
@@ -358,95 +433,86 @@ export function formatDpsTooltip(
   if (combatInfo.isRechargeableGun && combatInfo.rechargeableStats) {
     const stats = combatInfo.rechargeableStats;
     content += `<strong>Rechargeable Weapon (${stats.energySource}):</strong><br>`;
-    content += `  Damage per Full Charge: ${stats.damagePerFullCharge.toFixed(
-      0
-    )}<br>`;
-    content += `  Shots per Full Charge: ${stats.shotsPerFullCharge}<br>`;
-    content += `  Time to Full Recharge: ${
+    content += `  Dmg/Full Charge: ${stats.damagePerFullCharge.toFixed(0)}<br>`;
+    content += `  Shots/Full Charge: ${stats.shotsPerFullCharge}<br>`;
+    content += `  Recharge Time: ${
       stats.timeToFullRechargeSeconds === Infinity
         ? "Infinite"
-        : stats.timeToFullRechargeSeconds.toFixed(1) + " sec"
+        : stats.timeToFullRechargeSeconds.toFixed(1) + "s"
     }<br>`;
-    // Also show DPH if available
-    if (combatInfo.dphBase > 0 && combatInfo.ammoName) {
-      content += `<br>Base Projectile (if applicable):<br>  ${combatInfo.dphBase.toFixed(
-        0
-      )} ${combatInfo.damageType} / ${
-        combatInfo.ap
-      } AP (${combatInfo.ammoName.substring(0, 10)})<br>`;
+    if (
+      combatInfo.dphBase > 0 &&
+      combatInfo.ammoName &&
+      combatInfo.ammoName !== stats.energySource
+    ) {
+      content += `<br>Base Projectile:<br>  ${combatInfo.dphBase.toFixed(0)} ${
+        combatInfo.damageType
+      } / ${combatInfo.ap} AP<br>`;
     }
     return content;
   }
   if (combatInfo.isNonConventional && !combatInfo.isRechargeableGun) {
-    // Non-rechargeable, non-conventional (e.g. bows if not given DPS)
     content += `<strong>Non-Conventional Weapon (${
       combatInfo.nonConventionalType || ""
     }):</strong><br>`;
-    content += `Performance not directly comparable via standard DPS metrics here.<br>`;
+    content += `Standard DPS metrics may not fully represent performance.<br>`;
     if (combatInfo.dphBase > 0 && combatInfo.ammoName) {
-      // e.g. bows have DPH from ammo
       content += `<br>Base Projectile:<br>  ${combatInfo.dphBase.toFixed(0)} ${
         combatInfo.damageType
-      } / ${combatInfo.ap} AP (${combatInfo.ammoName.substring(0, 10)})<br>`;
+      } / ${combatInfo.ap} AP<br>`;
     }
     return content;
   }
 
-  if (
-    !combatInfo.modePerformances ||
-    combatInfo.modePerformances.length === 0
-  ) {
-    content += "No detailed mode performance data calculated.";
-    if (combatInfo.referenceSustainedDps !== null) {
-      // But we might have a single reference DPS
-      content += `<br>Reference DPS: ${combatInfo.referenceSustainedDps.toFixed(
-        1
-      )} (${combatInfo.referenceModeName || "Default Mode"}) at ${
-        combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
-      } tiles.`;
+  const refModeDisplay = combatInfo.referenceModeName || "Default";
+  const refRangeDisplay =
+    combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES;
+
+  if (combatInfo.referenceSustainedDps !== null) {
+    content += `<strong><u>Sustained DPS (Full Cycle)</u></strong><br>`;
+    content += `  Mode: ${refModeDisplay}, Range: ${refRangeDisplay}t<br>`;
+    content += `  <strong>DPS: ${combatInfo.referenceSustainedDps.toFixed(
+      1
+    )}</strong><br>`;
+    content += formatDpsDetails(
+      combatInfo.referenceSustainedDpsDetails,
+      "Sustained"
+    );
+  }
+
+  if (combatInfo.dpsMagDumpNoReload !== null) {
+    content += `<strong><u>DPS (Mag Dump, No Reload)</u></strong><br>`;
+    content += `  Mode: ${refModeDisplay}, Range: ${refRangeDisplay}t (Assumed)<br>`;
+    content += `  <strong>DPS: ${combatInfo.dpsMagDumpNoReload.toFixed(
+      1
+    )}</strong><br>`;
+    content += formatDpsDetails(combatInfo.dpsMagDumpDetails, "Mag Dump");
+  }
+
+  if (combatInfo.dpsPreciseAimPerShotNoReload !== null) {
+    content += `<strong><u>DPS (Precise Aim/Shot, No Reload)</u></strong><br>`;
+    content += `  Mode: ${refModeDisplay}, Range: ${refRangeDisplay}t (Assumed)<br>`;
+    content += `  <strong>DPS: ${combatInfo.dpsPreciseAimPerShotNoReload.toFixed(
+      1
+    )}</strong><br>`;
+    content += formatDpsDetails(
+      combatInfo.dpsPreciseAimPerShotDetails,
+      "Precise Aim"
+    );
+  }
+
+  if (combatInfo.modePerformances && combatInfo.modePerformances.length > 0) {
+    const refModePerf = combatInfo.modePerformances.find(
+      (mp) => mp.modeDetails.name === combatInfo.referenceModeName
+    );
+    if (refModePerf && refModePerf.dpsAtRanges.length > 1) {
+      content += `<br><strong><u>Sustained DPS by Range (Mode: ${refModePerf.modeDetails.name})</u></strong><br>`;
+      refModePerf.dpsAtRanges.forEach((rangeDps) => {
+        content += `  @ ${rangeDps.rangeTiles} tiles: ${
+          rangeDps.sustainedDps?.toFixed(1) ?? "N/A"
+        } DPS<br>`;
+      });
     }
-    return content;
   }
-
-  content += `<strong>Reference Mode: ${
-    combatInfo.referenceModeName || "Default"
-  }</strong> (DPS: ${
-    combatInfo.referenceSustainedDps?.toFixed(1) ?? "N/A"
-  } at ${
-    combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
-  } tiles)<br><br>`;
-
-  const refModePerf = combatInfo.modePerformances.find(
-    (mp) => mp.modeDetails.name === combatInfo.referenceModeName
-  );
-  if (refModePerf) {
-    content += `<u>DPS at various ranges (Reference Mode - ${refModePerf.modeDetails.name}):</u><br>`;
-    refModePerf.dpsAtRanges.forEach((rangeDps) => {
-      content += `  @ ${rangeDps.rangeTiles} tiles: ${
-        rangeDps.sustainedDps?.toFixed(1) ?? "N/A"
-      } DPS<br>`;
-    });
-    content += "<br>";
-  }
-
-  const otherModes = combatInfo.modePerformances.filter(
-    (mp) => mp.modeDetails.name !== combatInfo.referenceModeName
-  );
-  if (otherModes.length > 0) {
-    content += `<u>Performance of other modes at ${
-      combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES
-    } tiles:</u><br>`;
-    otherModes.forEach((modePerf) => {
-      const dpsAtRefRange = modePerf.dpsAtRanges.find(
-        (r) =>
-          r.rangeTiles ===
-          (combatInfo.referenceRangeTiles || DEFAULT_REFERENCE_RANGE_TILES)
-      )?.sustainedDps;
-      content += `  ${modePerf.modeDetails.name} (${
-        modePerf.modeDetails.shotsPerActivation
-      } RoF): ${dpsAtRefRange?.toFixed(1) ?? "N/A"} DPS<br>`;
-    });
-  }
-
   return content;
 }
