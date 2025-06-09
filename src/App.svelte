@@ -10,6 +10,8 @@ import { t } from "@transifex/native";
 import type { SupportedTypeMapped, SupportedTypesWithMapped } from "./types";
 import throttle from "lodash/throttle";
 
+import ComparisonPage from "./features/comparison/components/ComparisonPage.svelte";
+
 let item: { type: string; id: string } | null = null;
 
 let builds:
@@ -106,6 +108,11 @@ function decodeQueryParam(p: string) {
 function load() {
   const path = location.pathname.slice(import.meta.env.BASE_URL.length - 1);
   let m: RegExpExecArray | null;
+  if (path === '/compare' || path === '/compare/') {
+    item = { type: 'compare', id: 'compare' }; // A unique state for our page
+    search = "";
+    window.scrollTo(0, 0);
+  } 
   if ((m = /^\/([^\/]+)(?:\/(.+))?$/.exec(path))) {
     const [, type, id] = m;
     if (type === "search") {
@@ -333,7 +340,9 @@ function langHref(lang: string, href: string) {
   {#if item}
     {#if $data}
       {#key item}
-        {#if item.id}
+        {#if item.type === 'compare'}
+          <ComparisonPage data={$data} />
+        {:else if item.id}
           <Thing {item} data={$data} />
         {:else}
           <Catalog type={item.type} data={$data} />
