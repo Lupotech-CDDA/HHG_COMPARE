@@ -5,8 +5,8 @@ import { log } from "./logger";
 
 export type GunCategory =
   | "Assault Rifle" | "Rifle" | "Pistol" | "Submachine Gun" | "Shotgun"
-  | "Bow" | "Energy" | "CBM/Mutation" | "Chemical" | "Other Firearm"
-  | "Other Non-Standard";
+  | "Bow" | "Energy" | "CBM/Mutation" | "Chemical" | "Launcher" // <-- Added Launcher
+  | "Other Firearm" | "Other Non-Standard";
 
 export function classifyGunDetailed(gun: Item): GunCategory {
   const gunSlot = gun as Item & GunSlot;
@@ -17,11 +17,12 @@ export function classifyGunDetailed(gun: Item): GunCategory {
   let category: GunCategory;
 
   // --- Priority Checks for Non-Standard Types ---
-  // These checks now come first to correctly categorize special weapons
   if (gun.id.includes("chemical_thrower") || flags.includes("FLAMETHROWER")) {
     category = "Chemical";
   } else if (skill === "archery") {
     category = "Bow";
+  } else if (skill === "launcher") { // <-- NEW: Specific check for launchers
+    category = "Launcher";
   } else if (flags.includes("PSEUDO") || flags.includes("BIONIC_WEAPON")) {
     category = "CBM/Mutation";
   } else if (flags.includes("NEVER_JAMS") && flags.includes("NO_AMMO")) {
@@ -35,7 +36,7 @@ export function classifyGunDetailed(gun: Item): GunCategory {
     category = "Submachine Gun";
   } else if (skill === "shotgun") {
     category = "Shotgun";
-  } else if (skill === "rifle" || skill === "launcher") {
+  } else if (skill === "rifle") { // <-- REMOVED: No longer includes launcher
     const firingModes = gunSlot.modes ?? [];
     const hasBurstMode = firingModes.some(mode => mode[0] === "BURST" && (mode[1] ?? 0) > 1);
     category = hasBurstMode ? "Assault Rifle" : "Rifle";
