@@ -1,51 +1,80 @@
 // src/features/comparison/utils/classify.ts
 
-import type { Item, GunSlot, ItemBasicInfo } from "../../../types";
+import type { Item, GunSlot } from "../../../types";
 import { log } from "./logger";
+import { getFiringModes } from "../core/properties";
 
-export type GunCategory =
-  | "Assault Rifle" | "Rifle" | "Pistol" | "Submachine Gun" | "Shotgun"
-  | "Bow" | "Energy" | "CBM/Mutation" | "Chemical" | "Launcher" // <-- Added Launcher
-  | "Other Firearm" | "Other Non-Standard";
+// --- New Structured Category Type ---
+export type GunCategory = {
+  type: "Firearm" | "Archery" | "Energy" | "Launcher" | "Other";
+  subType:
+    | "Pistol"
+    | "SMG"
+    | "Shotgun"
+    | "Rifle"
+    | "Assault Rifle"
+    | "Bow / Crossbow"
+    | "Energy Weapon"
+    | "Grenade / Rocket"
+    | "Chemical"
+    | "Bionic / Mutation"
+    | "Other";
+};
 
+/**
+ * Classifies a gun into a structured category based on its properties.
+ */
 export function classifyGunDetailed(gun: Item): GunCategory {
-  const gunSlot = gun as Item & GunSlot;
-  const basicInfo = gun as ItemBasicInfo;
-  const skill = gunSlot.skill;
-  const flags = basicInfo.flags ?? [];
-  
-  let category: GunCategory;
+  // --- ADDED GUARD CLAUSE TO FIX RUNTIME ERROR ---
+  if (!gun) {
+    log("ERROR", "classifyGunDetailed was called with an undefined gun object.", { stack: new Error().stack });
+    return { type: "Other", subType: "Other" };
+  }
+  // --- END OF FIX ---
 
-  // --- Priority Checks for Non-Standard Types ---
+  const gunSlot = gun as Item & GunSlot;
+  const skill = gunSlot.skill;
+  const flags = gun.flags ?? [];
+
   if (gun.id.includes("chemical_thrower") || flags.includes("FLAMETHROWER")) {
-    category = "Chemical";
-  } else if (skill === "archery") {
-    category = "Bow";
-  } else if (skill === "launcher") { // <-- NEW: Specific check for launchers
-    category = "Launcher";
-  } else if (flags.includes("PSEUDO") || flags.includes("BIONIC_WEAPON")) {
-    category = "CBM/Mutation";
-  } else if (flags.includes("NEVER_JAMS") && flags.includes("NO_AMMO")) {
-    category = "Energy";
-  } else if (gunSlot.ups_charges || flags.includes("USE_UPS")) {
-    category = "Energy";
-  // --- Standard Firearm Classification ---
-  } else if (skill === "pistol") {
-    category = "Pistol";
-  } else if (skill === "smg") {
-    category = "Submachine Gun";
-  } else if (skill === "shotgun") {
-    category = "Shotgun";
-  } else if (skill === "rifle") { // <-- REMOVED: No longer includes launcher
-    const firingModes = gunSlot.modes ?? [];
-    const hasBurstMode = firingModes.some(mode => mode[0] === "BURST" && (mode[1] ?? 0) > 1);
-    category = hasBurstMode ? "Assault Rifle" : "Rifle";
-  } else if (skill) {
-    category = "Other Firearm";
-  } else {
-    category = "Other Non-Standard";
+    return { type: "Other", subType: "Chemical" };
+  }
+  if (skill === "archery") {
+    return { type: "Archery", subType: "Bow / Crossbow" };
+  }
+  if (skill === "launcher") {
+    return { type: "Launcher", subType: "Grenade / Rocket" };
+  }
+  if (flags.includes("PSEUDO") || flags.includes("BIONIC_WEAPON")) {
+    return { type: "Other", subType: "Bionic / Mutation" };
+  }
+  if (
+    (flags.includes("NEVER_JAMS") && flags.includes("NO_AMMO")) ||
+    gunSlot.ups_charges ||
+    flags.includes("USE_UPS")
+  ) {
+    return { type: "Energy", subType: "Energy Weapon" };
   }
 
-  log("DEBUG", `Classifying '${gun.id}' -> Result: ${category}`);
-  return category;
+  if (skill === "pistol") {
+    return { type: "Firearm", subType: "Pistol" };
+  }
+  if (skill === "smg") {
+    return { type: "Firearm", subType: "SMG" };
+  }
+  if (skill === "shotgun") {
+    return { type: "Firearm", subType: "Shotgun" };
+  }
+  if (skill === "rifle") {
+    const firingModes = getFiringModes(gunSlot);
+    const hasBurstMode = firingModes.some((mode) => mode.shots > 1);
+    const subType = hasBurstMode ? "Assault Rifle" : "Rifle";
+    return { type: "Firearm", subType: subType };
+  }
+
+  if (skill) {
+    return { type: "Firearm", subType: "Other" };
+  }
+
+  return { type: "Other", subType: "Other" };
 }

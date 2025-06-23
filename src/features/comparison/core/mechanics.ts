@@ -1,190 +1,179 @@
 // src/features/comparison/core/mechanics.ts
 
+// NOTE: This file is being provided again to fix a critical bug.
+// The code is largely the same, but the `getHitProbabilities` function
+// now correctly calculates probabilities instead of returning raw counts.
+
 import type { Item, GunSlot } from "../../../types";
-import {
-  MAX_SKILL,
-  MAX_RECOIL_MOA,
-  WEAPON_DISPERSION_CONSTANT_FIREARM,
-  DEFAULT_SIGHT_DISPERSION,
-  ACCURACY_CRITICAL_FACTOR,
-  ACCURACY_STANDARD_FACTOR,
-  ACCURACY_GRAZING_FACTOR,
-} from "../constants/defaults"; // We'll assume constants are in a separate file
+import { CombatProfile, DispersionSources, HitProbabilities } from "./types";
+import * as C from "../constants/index";
+import { logarithmic_range, calculate_iso_tangent_linear_deviation, get_occupied_tile_fraction } from "./utils";
 
-// --- Interfaces and Profiles ---
-export interface CombatProfile {
-  strength: number;
-  dexterity: number;
-  perception: number;
-  weaponSkillLevel: number;
-  marksmanshipLevel: number;
+// --- Private Functions (no change) ---
+function calculateRangedDexMod(dexterity: number): number {
+  return Math.max((C.STAT_THRESHOLD_FOR_PENALTY - dexterity) * C.RANGED_DEX_MOD_FACTOR, 0.0);
 }
 
-// --- Ported Combat Mechanic Functions ---
-
-// Note: In a real project, CddaData and SkillType would be imported from the main app's types.
-// For this module, we assume they are available.
-export function getMovesPerAttackActivation(
-  gunSkillId: string | null,
-  profile: CombatProfile,
-  processor: any // CddaData
-): number {
-  if (!gunSkillId) return 100;
-  const skillData = processor.byIdMaybe("skill", gunSkillId);
-  if (skillData && skillData.time_to_attack) {
-    const { base_time, time_reduction_per_level, min_time } =
-      skillData.time_to_attack;
-    const calculated = Math.round(
-      base_time - time_reduction_per_level * profile.weaponSkillLevel
-    );
-    return Math.max(min_time, calculated);
+function calculate_point_shooting_limit(skillLevel: number, gunSkillId: string): number {
+  const cappedSkill = Math.min(skillLevel, C.MAX_SKILL);
+  if (gunSkillId === "archery") {
+    return C.ARCHERY_PS_LIMIT_BASE + C.ARCHERY_PS_LIMIT_DIVISOR_FACTOR / (1.0 + cappedSkill);
   }
-  return 100;
+  return C.FIREARM_PS_LIMIT_BASE - C.FIREARM_PS_LIMIT_SKILL_FACTOR * cappedSkill;
 }
 
-export function dispersion_from_skill(
-  skill_val: number,
-  wep_disp_const: number = WEAPON_DISPERSION_CONSTANT_FIREARM
-): number {
-  if (skill_val >= MAX_SKILL) return 0;
+function calculate_modified_sight_speed(intrinsicSpeedMod: number, effectiveDispersion: number, currentRecoil: number): number {
+  if (currentRecoil <= effectiveDispersion || effectiveDispersion < 0) return 0;
+  const logRangeMax = 3.0 * effectiveDispersion + 1.0;
+  const attenuation = 1.0 - logarithmic_range(effectiveDispersion, logRangeMax, currentRecoil);
+  return (C.BASE_AIM_SPEED_CONSTANT + intrinsicSpeedMod) * attenuation;
+}
 
-  const skill_shortfall = MAX_SKILL - skill_val;
-  const dispersion_penalty_flat = 10 * skill_shortfall;
-  const skill_threshold = 5.0;
+function calculate_aim_per_move(gun: Item & GunSlot, profile: CombatProfile, currentRecoil: number): number {
+  const gunSkillId = gun.skill ?? 'N/A';
+  const psLimit = calculate_point_shooting_limit(profile.weaponSkillLevel, gunSkillId);
+  const psIntrinsicSpeed = gunSkillId === 'pistol' 
+    ? C.POINT_SHOOTING_PISTOL_BASE_SPEED_MOD + C.POINT_SHOOTING_PISTOL_SKILL_SPEED_FACTOR * profile.weaponSkillLevel 
+    : profile.weaponSkillLevel;
+  let sightSpeedMod = calculate_modified_sight_speed(psIntrinsicSpeed, psLimit, currentRecoil);
+
+  if (gun.sight_dispersion && currentRecoil <= C.IRON_SIGHT_FOV) {
+    const parallax = Math.max(0, (C.STAT_THRESHOLD_FOR_PENALTY - profile.perception) * C.RANGED_PER_MOD_FACTOR);
+    const ironEffDisp = parallax + gun.sight_dispersion;
+    const ironSpeed = calculate_modified_sight_speed(0, ironEffDisp, currentRecoil);
+    sightSpeedMod = Math.max(sightSpeedMod, ironSpeed);
+  }
+
+  let aimSpeed = C.BASE_AIM_SPEED_CONSTANT + sightSpeedMod;
+
+  aimSpeed += (profile.dexterity - C.AIM_SPEED_DEX_MOD_BASE_DEX) * C.AIM_SPEED_DEX_MOD_FACTOR;
+  aimSpeed += C.AIM_SPEED_SKILL_MOD_FIREARM_MULT * profile.weaponSkillLevel + C.AIM_SPEED_SKILL_MOD_FIREARM_BASE;
+
+  const skillDivisor = Math.max(1.0, C.AIM_SPEED_SKILL_DIVISOR_BASE - C.AIM_SPEED_SKILL_DIVISOR_SKILL_FACTOR * profile.weaponSkillLevel);
+  aimSpeed /= skillDivisor;
+
+  const recoilScaleFactor = Math.max(currentRecoil / C.MAX_RECOIL_MOA, 1.0 - logarithmic_range(0, C.MAX_RECOIL_MOA, currentRecoil));
+  aimSpeed *= recoilScaleFactor;
   
-  let dispersion_penalty_scaled: number;
-  if (skill_val >= skill_threshold) {
-    const divisor = MAX_SKILL - skill_threshold;
-    dispersion_penalty_scaled = divisor > 0
-      ? (wep_disp_const * skill_shortfall * 1.25) / divisor
-      : 0;
-  } else {
-    const pre_thresh_shortfall = skill_threshold - skill_val;
-    const pre_thresh_factor = skill_threshold > 0 ? (pre_thresh_shortfall * 10.0) / skill_threshold : 0;
-    dispersion_penalty_scaled = wep_disp_const * (1.25 + pre_thresh_factor);
-  }
-  return dispersion_penalty_flat + dispersion_penalty_scaled;
+  aimSpeed *= C.AIM_PER_MOVE_FINAL_SCALER;
+  aimSpeed = Math.max(aimSpeed, C.MIN_RECOIL_IMPROVEMENT_PER_MOVE);
+  
+  const limit = calculate_point_shooting_limit(profile.weaponSkillLevel, gunSkillId);
+  if (currentRecoil <= limit) return 0;
+  
+  return Math.min(aimSpeed, currentRecoil - limit);
 }
 
-export function getInherentWeaponDispersionMoa(
-  gunItem: Item & GunSlot,
-  ammoItem: Item & { dispersion?: number } | null,
-  profile: CombatProfile,
-  activeDefaultModDispersionBonus: number = 0
-): number {
-  const gunBaseDispersion = (gunItem.dispersion ?? 0) + activeDefaultModDispersionBonus;
-  const ammoBaseDispersion = ammoItem?.dispersion ?? 0;
-  const dexModDispersion = Math.max(0, (8 - profile.dexterity) * 10);
-  const avgCombatSkill = (profile.marksmanshipLevel + profile.weaponSkillLevel) / 2.0;
-  const skillPenaltyDispersion = dispersion_from_skill(avgCombatSkill);
 
-  const sumAdditiveDispersion =
-    gunBaseDispersion +
-    ammoBaseDispersion +
-    dexModDispersion +
-    skillPenaltyDispersion;
+// --- Exported Public Functions ---
 
-  return Math.max(0, sumAdditiveDispersion);
+export function calculateTimeToAttack(weaponSkillLevel: number, skillUsed: string): number {
+  const timeInfo = C.SKILL_TIME_TO_ATTACK_DATA[skillUsed] ?? C.DEFAULT_TIME_TO_ATTACK;
+  const effectiveSkillLevel = Math.min(weaponSkillLevel, C.MAX_SKILL);
+  const calculatedTime = timeInfo.base_time - timeInfo.time_reduction_per_level * effectiveSkillLevel;
+  return Math.max(timeInfo.min_time, Math.round(calculatedTime));
 }
 
-export function getRecoilAbsorbFactor(profile: CombatProfile): number {
-  return Math.min(profile.weaponSkillLevel, MAX_SKILL) / (MAX_SKILL * 2.0);
+export function calculateGunRecoil(gunItem: Item & GunSlot, ammoRecoil: number, profile: CombatProfile): number {
+    const armStrength = profile.strength;
+    const gunBaseWeightGrams = ((gunItem.weight as number) ?? 0) * 453.592;
+    const effectiveWeight = Math.min(gunBaseWeightGrams, armStrength * 333) / 333;
+    let handling = gunItem.handling ?? 0;
+    handling /= 10;
+    handling = Math.pow(effectiveWeight, 0.8) * Math.pow(handling, 1.2);
+    let qty = (gunItem.recoil ?? 0) + ammoRecoil;
+    qty = handling > 1.0 ? qty / handling : qty * (1.0 + Math.abs(handling));
+    return Math.max(0, qty);
 }
 
-export function getEffectiveGunRecoilQtyPerShot(
-  gunItem: Item & GunSlot,
-  ammoRecoilValue: number,
-  profile: CombatProfile,
-  activeDefaultModHandlingBonus: number = 0,
-  activeDefaultModRecoilFactor: number = 1.0
-): number {
-  let currentRecoil = ammoRecoilValue;
-  const effectiveHandling = (gunItem.handling ?? 0) + activeDefaultModHandlingBonus;
-  currentRecoil = Math.max(0, currentRecoil - effectiveHandling * 20);
-  currentRecoil *= activeDefaultModRecoilFactor;
-  currentRecoil = Math.max(0, currentRecoil - (profile.strength * 10));
-
-  // Simplified bipod check for this port
-  if ((gunItem as ItemBasicInfo).flags?.includes("BIPOD")) {
-    currentRecoil *= 0.25;
-  }
-
-  return Math.max(0, currentRecoil);
-}
-
-export function getIncreaseInRecoilMoaPerShot(
-  effectiveGunRecoilQty: number,
-  recoilAbsorbFactor: number
-): number {
-  // The V1 formula converted "recoil units" to MOA with a *5 multiplier
-  return effectiveGunRecoilQty * (1.0 - recoilAbsorbFactor) * 5.0;
-}
-
-export function getHitProbabilities(
-  effectiveTotalDispersionMoa: number,
-  targetAngularSizeMoa: number
-): { P_Crit: number; P_Hit: number; P_Graze: number; P_Miss: number } {
-    if (targetAngularSizeMoa <= 0) return { P_Crit: 0, P_Hit: 0, P_Graze: 0, P_Miss: 1.0 };
-    if (effectiveTotalDispersionMoa <= 0) return { P_Crit: 1.0, P_Hit: 0, P_Graze: 0, P_Miss: 0 };
-    
-    // Simplified linear probability model from V1
-    const pGrazeTotal = Math.max(0, Math.min(1.0, (targetAngularSizeMoa * ACCURACY_GRAZING_FACTOR) / effectiveTotalDispersionMoa));
-    const pHitTotal = Math.max(0, Math.min(1.0, (targetAngularSizeMoa * ACCURACY_STANDARD_FACTOR) / effectiveTotalDispersionMoa));
-    const pCrit = Math.max(0, Math.min(1.0, (targetAngularSizeMoa * ACCURACY_CRITICAL_FACTOR) / effectiveTotalDispersionMoa));
-
-    const pHit = Math.max(0, pHitTotal - pCrit);
-    const pGraze = Math.max(0, pGrazeTotal - pHitTotal);
-    
-    const pMiss = Math.max(0, 1.0 - (pCrit + pHit + pGraze));
-    
-    return { P_Crit: pCrit, P_Hit: pHit, P_Graze: pGraze, P_Miss: pMiss };
-}
-
-export function estimateMovesToReachRecoil(
-  gunItem: Item & GunSlot,
-  targetPlayerRecoilMOA: number,
-  startPlayerRecoilMOA: number,
-  profile: CombatProfile,
-): number {
-  const gunBaseSightDispersion = gunItem.sight_dispersion ?? DEFAULT_SIGHT_DISPERSION;
-  const perceptionFactor = (gunItem.skill === "pistol" || gunItem.skill === "smg" || gunItem.skill === "shotgun") ? 3 : 5;
-  const parallaxOffset = Math.max(0, Math.round((8 - profile.perception) * perceptionFactor));
-  const perceptionAdjustedSightLimit = Math.max(10, gunBaseSightDispersion + parallaxOffset);
-  const effectiveAimTargetMOA = Math.max(targetPlayerRecoilMOA, perceptionAdjustedSightLimit);
-
-  if (startPlayerRecoilMOA <= effectiveAimTargetMOA) return 0;
-
-  let currentTotalPlayerRecoil = startPlayerRecoilMOA;
-  let movesSpent = 0;
-  const MAX_AIM_MOVES_SIMULATION = 750;
-  const MIN_RECOIL_IMPROVEMENT_PER_MOVE = 0.05;
-
-  while (currentTotalPlayerRecoil > effectiveAimTargetMOA && movesSpent < MAX_AIM_MOVES_SIMULATION) {
-    let aimSpeed = 10.0; // base_aim_speed
-    const pointShootingLimit = 200 - 10 * profile.weaponSkillLevel;
-    
-    let sightSpeedModContribution = (currentTotalPlayerRecoil > pointShootingLimit)
-      ? (10 + 4 * profile.weaponSkillLevel) // Point shooting speed
-      : Math.max(1, gunBaseSightDispersion / 20); // Iron sight speed
-      
-    aimSpeed += sightSpeedModContribution;
-    aimSpeed += (profile.dexterity - 8) * 0.5; // Dex mod
-    aimSpeed /= Math.max(1.0, 2.5 - 0.2 * profile.weaponSkillLevel); // Skill divisor
-
-    // Simplified recoil attenuation and other factors from V1
-    const recoilAttenuation = Math.max(0.25, 1.0 - (currentTotalPlayerRecoil / MAX_RECOIL_MOA) * 0.75);
-    aimSpeed *= recoilAttenuation;
-
-    let actualImprovement = Math.min(aimSpeed, currentTotalPlayerRecoil - effectiveAimTargetMOA);
-    actualImprovement = Math.max(MIN_RECOIL_IMPROVEMENT_PER_MOVE, actualImprovement);
-
-    if (actualImprovement <= MIN_RECOIL_IMPROVEMENT_PER_MOVE && currentTotalPlayerRecoil > effectiveAimTargetMOA) {
-        return MAX_AIM_MOVES_SIMULATION; // Stalled
+export function calculateDispersionFromSkill(avgSkill: number, gunSkillId: string): number {
+  if (avgSkill >= C.MAX_SKILL) return 0.0;
+  const pValToUse = gunSkillId === "archery" ? C.P_VAL_ARCHERY : C.P_VAL_FIREARMS;
+  const skillShortfall = C.MAX_SKILL - avgSkill;
+  let dispersionPenalty = C.DISP_FROM_SKILL_BASE_PENALTY_PER_SHORTFALL * skillShortfall;
+  if (avgSkill >= C.DISP_FROM_SKILL_THRESHOLD) {
+    const denominator = C.MAX_SKILL - C.DISP_FROM_SKILL_THRESHOLD;
+    if (denominator > 0) {
+      dispersionPenalty += (pValToUse * skillShortfall * C.DISP_FROM_SKILL_POST_THRESH_WEAP_DISP_FACTOR) / denominator;
     }
+  } else {
+    const preThresholdShortfall = C.DISP_FROM_SKILL_THRESHOLD - avgSkill;
+    dispersionPenalty += pValToUse * (C.DISP_FROM_SKILL_PRE_THRESH_WEAP_DISP_BASE_FACTOR + preThresholdShortfall * C.DISP_FROM_SKILL_PRE_THRESH_CALC_FACTOR);
+  }
+  return dispersionPenalty;
+}
 
-    currentTotalPlayerRecoil -= actualImprovement;
+export function getWeaponDispersionSources(gunItem: Item & GunSlot, ammoItem: Item & { dispersion?: number } | null, profile: CombatProfile, gunSkillId: string): DispersionSources {
+    const gunDamage = (gunItem as any).damage_level ?? 0;
+    const baseDisp = (gunItem.dispersion ?? 0) + (ammoItem?.dispersion ?? 0) + (gunDamage * C.DISPERSION_PER_GUN_DAMAGE);
+    const scaledBaseDispersion = Math.max(1, Math.round(baseDisp / C.GUN_DISPERSION_DIVIDER));
+    const dispSources = new DispersionSources(scaledBaseDispersion);
+    dispSources.add_range(calculateRangedDexMod(profile.dexterity));
+    const manipPenalty = Math.max(0, (1.0 - profile.handManipScore) * 22.8);
+    dispSources.add_range(manipPenalty);
+    const avgSkill = (profile.marksmanshipLevel + profile.weaponSkillLevel) / 2.0;
+    dispSources.add_range(calculateDispersionFromSkill(avgSkill, gunSkillId));
+    return dispSources;
+}
+
+export function getHitOutcome(rolledAngularDeviationMoa: number, targetRangeTiles: number, creatureSizeStr: "tiny" | "small" | "medium" | "large" | "huge"): "Miss" | "Graze" | "Normal" | "Good" | "Critical" {
+  const linearDeviation = calculate_iso_tangent_linear_deviation(targetRangeTiles, rolledAngularDeviationMoa);
+  const targetRadiusTiles = 0.5 * get_occupied_tile_fraction(creatureSizeStr);
+  if (targetRadiusTiles <= 0) return "Miss";
+  const missedByFactor = linearDeviation / targetRadiusTiles;
+  if (missedByFactor >= 1.0) return "Miss";
+  if (missedByFactor >= C.ACCURACY_STANDARD_FACTOR) return "Graze";
+  if (missedByFactor >= C.ACCURACY_GOODHIT_FACTOR) return "Normal";
+  if (missedByFactor >= C.ACCURACY_CRITICAL_FACTOR) return "Good";
+  return "Critical";
+}
+
+/**
+ * THIS FUNCTION IS NOW CORRECTED
+ */
+export function getHitProbabilities(dispersionSources: DispersionSources, targetRangeTiles: number, creatureSizeStr: "tiny" | "small" | "medium" | "large" | "huge", numSimulations: number = 5000): HitProbabilities {
+  const counts: Record<string, number> = { Critical: 0, Good: 0, Normal: 0, Graze: 0, Miss: 0 };
+  if(numSimulations <= 0) return counts as HitProbabilities;
+
+  for (let i = 0; i < numSimulations; i++) {
+    const outcome = getHitOutcome(dispersionSources.roll(), targetRangeTiles, creatureSizeStr);
+    counts[outcome]++;
+  }
+
+  // THE BUG FIX: Divide counts by numSimulations to get probabilities
+  return {
+    Critical: counts.Critical / numSimulations,
+    Good: counts.Good / numSimulations,
+    Normal: counts.Normal / numSimulations,
+    Graze: counts.Graze / numSimulations,
+    Miss: counts.Miss / numSimulations,
+  };
+}
+
+export function getExpectedDamagePerShot(baseDamage: number, hitProbabilities: HitProbabilities): number {
+    const critDmg = baseDamage * C.CRITICAL_HIT_DAMAGE_MULTIPLIER * hitProbabilities.Critical;
+    const goodDmg = baseDamage * C.GOOD_HIT_DAMAGE_MULTIPLIER * hitProbabilities.Good;
+    const normalDmg = baseDamage * C.NORMAL_HIT_DAMAGE_MULTIPLIER * hitProbabilities.Normal;
+    const grazeDmg = baseDamage * C.GRAZE_HIT_DAMAGE_MULTIPLIER * hitProbabilities.Graze;
+    // Removed the erroneous "/ 1"
+    return critDmg + goodDmg + normalDmg + grazeDmg;
+}
+
+export function simulateAiming(gunItem: Item & GunSlot, targetRecoilMoa: number, startRecoilMoa: number, profile: CombatProfile, scenario: { targetAngularSizeMoa: number }): { moves: number; finalRecoil: number } {
+  const aimLimit = calculate_point_shooting_limit(profile.weaponSkillLevel, gunItem.skill ?? 'N/A');
+  const effectiveAimTarget = Math.max(targetRecoilMoa, aimLimit);
+  if (startRecoilMoa <= effectiveAimTarget) {
+    return { moves: 0, finalRecoil: startRecoilMoa };
+  }
+  let currentRecoil = startRecoilMoa;
+  let movesSpent = 0;
+  while (currentRecoil > effectiveAimTarget && movesSpent < 750) {
+    const reduction = calculate_aim_per_move(gunItem, profile, currentRecoil, scenario);
+    if (reduction < C.MIN_RECOIL_IMPROVEMENT_PER_MOVE) {
+      break; 
+    }
+    currentRecoil -= reduction;
     movesSpent++;
   }
-
-  return movesSpent;
+  return { moves: movesSpent, finalRecoil: Math.max(currentRecoil, effectiveAimTarget) };
 }

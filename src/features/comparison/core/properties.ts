@@ -1,155 +1,170 @@
 // src/features/comparison/core/properties.ts
 
-import type { Item, GunSlot, AmmoSlot, ItemBasicInfo } from "../../../types";
+// --- Corrected Imports ---
+import type { Item, GunSlot, AmmoSlot, ItemBasicInfo, PocketData, Translation } from "../../../types";
 import type { CddaData } from "../../../data";
 import { normalizeDamageInstance } from "../../../data";
 import { log } from "../utils/logger";
+import {
+  CombatProfile,
+  PotentialDamageInfo,
+  FiringMode,
+} from "./types";
+import {
+  CRITICAL_HIT_DAMAGE_MULTIPLIER_DEFAULT,
+} from "../constants/index";
+import { getWeaponDispersionSources } from "./mechanics";
 
-// --- Interfaces (no change) ---
-export interface PotentialDamageInfo {
-  damage: number;
-  ammoName: string;
-  damageType: string;
-  ap: number;
-  ammoItem: (Item & AmmoSlot) | null;
-  ammoCritMultiplier: number;
-  pelletCount?: number;
-}
+// Type alias for the inline tuple
+type JsonFiringModeTuple = [string, string, number] | [string, string, number, string[] | string];
 
-// --- Helper Functions (NEW ROBUST LOGIC) ---
+// A helper type for items that might have an ammo_modifier
+type ItemWithAmmoModifier = Item & { ammo_modifier?: string[] };
 
 /**
- * Gets all ammo types that a gun can fire.
- * NEW: Now inspects default_mods to handle modular weapons.
+ * Safely gets the singular name string from a Translation object or a simple string.
  */
-function getFireableAmmoTypes(gun: Item, processor: CddaData): Set<string> {
-  const gunSlot = gun as Item & GunSlot;
-  const fireableAmmoTypes = new Set<string>();
+function getSingularName(name: Translation | string | undefined): string | undefined {
+    if (typeof name === 'string') {
+        return name;
+    }
+    return name?.str;
+}
 
-  // 1. Check the gun's direct 'ammo' property
+// =============================================================================
+// SECTION: Helper Functions for Modular Weapons
+// =============================================================================
+
+function getChamberings(gun: Item, processor: CddaData): Set<string> {
+  const gunSlot = gun as Item & GunSlot;
+  const chamberings = new Set<string>();
+
   if (gunSlot.ammo) {
-    gunSlot.ammo.forEach(ammoType => fireableAmmoTypes.add(ammoType));
+    const ammoList = Array.isArray(gunSlot.ammo) ? gunSlot.ammo : [gunSlot.ammo];
+    ammoList.forEach((ammoType) => chamberings.add(ammoType));
   }
 
-  // 2. NEW LOGIC: Check default_mods for magazines or mods that add ammo types
-  if (gunSlot.default_mods) {
-    for (const modId of gunSlot.default_mods) {
-      const mod = processor.byIdMaybe("item", modId);
-      if (mod && mod.type === "MAGAZINE" && mod.ammo_modifier) {
-        log("DEBUG", `Found ammo_modifier on default mag '${modId}' for gun '${gun.id}'`, mod.ammo_modifier);
-        mod.ammo_modifier.forEach((ammoType: string) => fireableAmmoTypes.add(ammoType));
+  if (gunSlot.pocket_data) {
+    for (const pocket of gunSlot.pocket_data) {
+      if (pocket.magazine_well && pocket.ammo_restriction) {
+        for (const ammoType in pocket.ammo_restriction) {
+          chamberings.add(ammoType);
+        }
       }
     }
   }
-  
-  log("DEBUG", `Final discovered ammo types for '${gun.id}'`, Array.from(fireableAmmoTypes));
-  return fireableAmmoTypes;
+
+  if (gunSlot.default_mods) {
+    for (const modId of gunSlot.default_mods) {
+      const mod = processor.byIdMaybe("item", modId) as Item & GunSlot;
+      if (!mod) continue;
+      
+      if (mod.ammo) {
+        const ammoList = Array.isArray(mod.ammo) ? mod.ammo : [mod.ammo];
+        ammoList.forEach((ammoType) => chamberings.add(ammoType));
+      }
+
+      // CORRECTED: Use type assertion to access ammo_modifier
+      const modWithAmmoModifier = mod as ItemWithAmmoModifier;
+      if (mod.type === "MAGAZINE" && modWithAmmoModifier.ammo_modifier) {
+        modWithAmmoModifier.ammo_modifier.forEach((ammoType: string) =>
+          chamberings.add(ammoType)
+        );
+      }
+    }
+  }
+
+  return chamberings;
 }
 
-/**
- * Gets all ammo items that a gun can fire, based on the discovered types.
- */
-export function getFireableAmmoObjects(gun: Item, processor: CddaData): (Item & AmmoSlot)[] {
-  const fireableAmmoTypes = getFireableAmmoTypes(gun, processor);
+export function getFireableAmmoObjects(
+  gun: Item,
+  processor: CddaData
+): (Item & AmmoSlot)[] {
+  const chamberings = getChamberings(gun, processor);
   const ammoItems: (Item & AmmoSlot)[] = [];
 
-  for (const ammoType of fireableAmmoTypes) {
+  for (const ammoType of chamberings) {
     const ammoTypeData = processor.byIdMaybe("ammunition_type", ammoType);
-    if (ammoTypeData && ammoTypeData.default) {
-      const ammoItem = processor.byIdMaybe("item", ammoTypeData.default) as Item & AmmoSlot;
+    if (ammoTypeData?.default) {
+      const ammoItem = processor.byIdMaybe(
+        "item",
+        ammoTypeData.default
+      ) as Item & AmmoSlot;
       if (ammoItem) {
         ammoItems.push(ammoItem);
       }
     }
   }
+
+  if (ammoItems.length === 0 && chamberings.size === 0) {
+    return [{ id: "null" } as Item & AmmoSlot];
+  }
+
   return ammoItems;
 }
 
-/**
- * Selects the most representative "standard" ammunition from a list.
- * (No changes here, but included for completeness)
- */
-function classifyAndSelectStandardAmmo(
-  possibleAmmoItems: (Item & AmmoSlot)[],
-  gunId: string
-): (Item & AmmoSlot) | null {
-  if (possibleAmmoItems.length === 0) return null;
-  if (possibleAmmoItems.length === 1) return possibleAmmoItems[0];
-
-  const conventionalAmmo = possibleAmmoItems.filter(ammo => {
-    const flags = (ammo as ItemBasicInfo).flags ?? [];
-    return !flags.includes("BLACKPOWDER") && !flags.includes("NEVER_MISFIRES");
-  });
-
-  const ammoToConsider = conventionalAmmo.length > 0 ? conventionalAmmo : possibleAmmoItems;
-
-  const ammoWithDamage = ammoToConsider.map(ammo => {
-    // ADDED DEFENSIVE CHECK
-    if (!ammo.damage) {
-      log("WARN", `Ammo '${ammo.id}' is missing damage property, excluding from selection for gun '${gunId}'.`);
-      return { ammo, totalDmg: 0 };
-    }
-    const normalizedDmg = normalizeDamageInstance(ammo.damage);
-    const totalDmg = normalizedDmg.reduce((sum, dmg) => sum + (dmg.amount ?? 0), 0);
-    return { ammo, totalDmg };
-  }).filter(item => item.totalDmg > 0);
-
-  if (ammoWithDamage.length === 0) {
-    log("WARN", `No ammo with damage > 0 found for '${gunId}'.`);
-    return null;
+export function getFiringModes(gun: Item & GunSlot): FiringMode[] {
+  if (!gun.modes) {
+    return [{ id: "DEFAULT", name: "semi-auto", shots: 1 }];
   }
 
-  ammoWithDamage.sort((a, b) => a.totalDmg - b.totalDmg);
-  const medianIndex = Math.floor(ammoWithDamage.length / 2);
-  return ammoWithDamage[medianIndex].ammo;
+  return gun.modes.map((mode: JsonFiringModeTuple) => ({
+    id: mode[0],
+    name: mode[1],
+    shots: mode[2],
+  }));
 }
 
-// --- Main Function (with defensive checks) ---
+// =============================================================================
+// SECTION: Main Calculation Function
+// =============================================================================
 
-export function getRepresentativeDPHInfo(
-  gun: Item,
+export function getDphInfoForAmmo(
+  gun: Item & GunSlot,
+  ammo: Item & AmmoSlot,
+  profile: CombatProfile,
   processor: CddaData
 ): PotentialDamageInfo | null {
-  const fireableAmmos = getFireableAmmoObjects(gun, processor);
-
-  if (fireableAmmos.length === 0) {
-    log("DEBUG", `No fireable ammo found for '${gun.id}' after checking base property and default mods.`);
-    return null;
-  }
-  
-  const representativeAmmo = classifyAndSelectStandardAmmo(fireableAmmos, gun.id);
-
-  if (!representativeAmmo) {
-    log("WARN", `Could not select a representative ammo for '${gun.id}' from ${fireableAmmos.length} options.`);
+  if (!ammo?.damage) {
     return null;
   }
 
-  // --- ADDED DEFENSIVE CHECK TO PREVENT CRASH ---
-  if (!representativeAmmo.damage) {
-      log("ERROR", `Representative ammo '${representativeAmmo.id}' for gun '${gun.id}' has an UNDEFINED damage property. Cannot process.`, representativeAmmo);
-      return null;
-  }
-  // --- END OF DEFENSIVE CHECK ---
-
-  const normalizedDmg = normalizeDamageInstance(representativeAmmo.damage);
+  const normalizedDmg = normalizeDamageInstance(ammo.damage);
   if (normalizedDmg.length === 0) {
-    log("WARN", `Representative ammo '${representativeAmmo.id}' for gun '${gun.id}' has no valid damage instance after normalization.`);
     return null;
   }
 
-  const primaryDamage = normalizedDmg[0];
-  const totalDamage = normalizedDmg.reduce((sum, dmg) => sum + (dmg.amount ?? 0), 0);
+  const totalDamage = normalizedDmg.reduce(
+    (sum, dmg) => sum + (dmg.amount ?? 0),
+    0
+  );
+
+  const isShotgunAmmo = (ammo as { ammo_type?: string }).ammo_type === "shot";
+  const pelletCount = isShotgunAmmo ? ammo.count ?? 1 : 1;
+
+  const gunSkillId = gun.skill ?? "N/A";
+  const dispersionSources = getWeaponDispersionSources(
+    gun,
+    ammo,
+    profile,
+    gunSkillId
+  );
+  const inherentDispersionMoa = dispersionSources.max();
+
+  // CORRECTED: Use the helper to safely get the name
+  const ammoName = getSingularName((ammo as ItemBasicInfo).name) ?? ammo.id;
 
   const result: PotentialDamageInfo = {
     damage: totalDamage,
-    ammoName: (representativeAmmo as ItemBasicInfo).name?.str ?? representativeAmmo.id,
-    damageType: primaryDamage.damage_type ?? "N/A",
-    ap: primaryDamage.armor_penetration ?? 0,
-    ammoItem: representativeAmmo,
-    ammoCritMultiplier: representativeAmmo.critical_multiplier ?? 1.5,
-    pelletCount: representativeAmmo.count ?? 1,
+    ammoName: ammoName,
+    ammoRecoil: ammo.recoil ?? 0,
+    inherentDispersionMoa: inherentDispersionMoa,
+    ammoItem: ammo,
+    pelletCount: pelletCount,
+    ammoCritMultiplier:
+      (ammo as any).critical_multiplier ?? CRITICAL_HIT_DAMAGE_MULTIPLIER_DEFAULT,
   };
 
-  log("SUCCESS", `Successfully calculated DPH for '${gun.id}' using ammo '${result.ammoName}'`, result);
   return result;
 }
